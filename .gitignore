@@ -1,7 +1,3 @@
-# Build output (charset_rom.h is generated into build/ by the Makefile)
 build/
-
-# ROMs are yours, not this repository's
-web/rom.bin
-
+web/*.bin
 .DS_Store

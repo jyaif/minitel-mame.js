@@ -3,6 +3,7 @@
 #   make            build web/minitel.js + web/minitel.wasm
 #   make serve      build, then serve web/ on http://localhost:8000
 #   make dist       build and zip web/ for upload to itch.io
+#   make pages      build, then refresh docs/ for GitHub Pages
 #   make clean
 
 CORE     := $(wildcard src/core/*.cpp)
@@ -56,7 +57,7 @@ EMFLAGS := -Oz -DMINITEL_QUIET -fno-exceptions -fno-rtti \
            --no-entry \
            --closure 1
 
-.PHONY: all serve dist clean
+.PHONY: all serve dist pages clean
 
 all: web/minitel.js
 
@@ -78,6 +79,15 @@ dist: all
 	@mkdir -p build
 	cd web && zip -9 -r ../build/minitel-web.zip . -x '.*'
 	@ls -l build/minitel-web.zip
+
+# GitHub Pages serves docs/ off the default branch. Only the built page goes
+# there: docs/config.js and the ROMs beside it are the published site's own,
+# and are not what web/ happens to be holding.
+PAGES := index.html minitel.js minitel.wasm
+
+pages: all
+	cp $(addprefix web/,$(PAGES)) docs/
+	@ls -l $(addprefix docs/,$(PAGES))
 
 clean:
 	rm -rf build web/minitel.js web/minitel.wasm

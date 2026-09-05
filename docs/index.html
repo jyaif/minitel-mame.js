@@ -1,0 +1,1978 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Minitel 2</title>
+<style>
+  /* Embedded in an iframe, which may be made fullscreen: no chrome,
+     no scrollbars, no gestures -- just the tube, letterboxed to 4:3. */
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    color-scheme: dark;
+  }
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #screen {
+    display: block;
+    width: min(100vw, calc(100vh * 4 / 3));
+    height: min(100vh, calc(100vw * 3 / 4));
+    image-rendering: pixelated;   /* only reached on the 2D fallback */
+  }
+
+  /* Shown only when no rom.bin sits next to the page, so a published game
+     never sees it. */
+  #drop {
+    position: fixed;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: #000c;
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    color: #d8cbb4;
+    text-align: center;
+    padding: 24px;
+  }
+  #drop.on { display: flex; }
+  #drop label {
+    border: 1px dashed #4a3c2c;
+    border-radius: 10px;
+    padding: 28px 34px;
+    cursor: pointer;
+  }
+  #drop input { display: none; }
+
+  /* The ROM menu, present only when config.js lists more than one image.
+     Dimmed until it is wanted, so a page showing a single game the whole time
+     is not asking to be clicked. It sits over the picture rather than beside
+     it: the frame is letterboxed to 4:3 and there is no room outside. */
+  #roms {
+    position: fixed;
+    top: 10px;
+    right: 12px;
+    z-index: 1;
+    display: none;
+    max-width: 45vw;
+    padding: 5px 8px;
+    border: 1px solid #4a3c2c;
+    border-radius: 8px;
+    background: #000a;
+    color: #d8cbb4;
+    font: 12px/1.2 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    opacity: .45;
+    transition: opacity .15s;
+    cursor: pointer;
+  }
+  #roms.on { display: block; }
+  #roms:hover, #roms:focus { opacity: 1; }
+</style>
+</head>
+<body>
+
+<canvas id="screen" width="334" height="278"></canvas>
+
+<div id="drop">
+  <label>
+    <b>Drop a Minitel ROM here</b><br>
+    <span style="color:#8d7f68">or click to choose a .bin file</span>
+    <input type="file" id="file" accept=".bin,.rom,application/octet-stream">
+  </label>
+</div>
+
+<!-- After #drop, so it stays reachable while the drop panel is up. -->
+<select id="roms" aria-label="ROM"></select>
+
+<script src="config.js"></script>
+<script src="minitel.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  // ---------------------------------------------------------------------
+  // Keyboard matrix.
+  //
+  // Nine of the Minitel's sixteen scan rows carry keys; each entry below is
+  // [row, bit] straight out of MAME's minitel2 input ports. Physical key
+  // positions come from KeyboardEvent.code, which lines up with the
+  // US-positional KEYCODE_* names the driver uses.
+  // ---------------------------------------------------------------------
+  var KEYMAP = {
+    BracketLeft: [0, 0], KeyY: [0, 1], KeyR: [0, 2], KeyD: [0, 3],
+    Space: [0, 6], KeyC: [0, 7],
+
+    Escape: [1, 1], KeyA: [1, 2], ControlLeft: [1, 3],
+    AltRight: [1, 5], ShiftRight: [1, 6], ShiftLeft: [1, 7],
+
+    Digit2: [2, 0], KeyO: [2, 1], KeyL: [2, 2],
+    Digit5: [2, 4], Digit8: [2, 5], KeyN: [2, 6], KeyJ: [2, 7],
+
+    Semicolon: [4, 0], KeyU: [4, 1], KeyT: [4, 2], KeyF: [4, 3],
+    ArrowLeft: [4, 6], KeyV: [4, 7],
+
+    Slash: [6, 0], KeyI: [6, 1], KeyK: [6, 2], Digit9: [6, 3],
+    Digit6: [6, 5], ArrowRight: [6, 6], KeyH: [6, 7],
+
+    Quote: [8, 0], Period: [8, 1], KeyE: [8, 2], KeyS: [8, 3],
+    Backspace: [8, 4], Delete: [8, 5], ArrowDown: [8, 6], KeyX: [8, 7],
+
+    KeyP: [10, 1], KeyM: [10, 2], Digit0: [10, 3], Digit3: [10, 4],
+    NumpadMultiply: [10, 5], NumpadAdd: [10, 7],
+
+    Digit1: [12, 1], Digit4: [12, 2], Enter: [12, 3], Digit7: [12, 4],
+    KeyB: [12, 6], KeyG: [12, 7],
+
+    Backquote: [14, 0], Comma: [14, 1], KeyZ: [14, 2], KeyQ: [14, 3],
+    ArrowUp: [14, 6], KeyW: [14, 7]
+  };
+
+  // The labels printed on the Minitel's own keys. config.js accepts these as
+  // key names, and the browser's function keys are routed through them.
+  var MINITEL_KEYS = {
+    Suite: [0, 4], Retour: [0, 5], Envoi: [4, 4], Repetition: [4, 5],
+    Tel: [6, 4], Guide: [14, 4], Sommaire: [14, 5], Connexion: [1, 4],
+    MarcheArret: [12, 5], Fonction: [1, 5], Annulation: [1, 1], Correction: [8, 4]
+  };
+
+  var FKEYS = {
+    F1: MINITEL_KEYS.Suite, F2: MINITEL_KEYS.Retour, F3: MINITEL_KEYS.Envoi,
+    F4: MINITEL_KEYS.Repetition, F5: MINITEL_KEYS.Tel, F6: MINITEL_KEYS.Guide,
+    F7: MINITEL_KEYS.Sommaire, F8: MINITEL_KEYS.Connexion,
+    F10: MINITEL_KEYS.MarcheArret
+  };
+
+  // ---------------------------------------------------------------------
+  // Configuration, from config.js. The file, and any field in it, may be
+  // absent; the defaults below are then used.
+  // ---------------------------------------------------------------------
+  var CFG = (window.MINITEL_CONFIG && typeof window.MINITEL_CONFIG === "object")
+    ? window.MINITEL_CONFIG : {};
+
+  function warn(msg) { if (window.console) window.console.warn("Minitel: " + msg); }
+
+  function resolveKey(name) {
+    var entry = KEYMAP[name] || MINITEL_KEYS[name];
+    if (!entry) warn('config.js names an unknown key "' + name + '"');
+    return entry || null;
+  }
+
+  // One key steps through the display modes. Not "Tab" by default: Tab is how a
+  // keyboard user moves out of an embedded frame, so swallowing it without
+  // being asked to would break something the visitor relies on. Backslash is
+  // free on the Minitel matrix, reserved by no browser, and present on every
+  // layout. config.js can still choose Tab.
+  var DISPLAY_KEY = CFG.displayKey === undefined ? "Backslash" : CFG.displayKey;
+
+  // A shortcut that is also a Minitel key would swallow it, which is a quiet
+  // and confusing way for a keyboard to half-work.
+  if (DISPLAY_KEY && (KEYMAP[DISPLAY_KEY] || FKEYS[DISPLAY_KEY]))
+    warn('config.js displayKey is "' + DISPLAY_KEY + '", which is also a Minitel '
+         + 'key — the machine will never receive it');
+
+  // The video rate. 50 is the real machine and the default; 60 is the value
+  // MAME's driver declares, kept reachable because a ROM developed against
+  // MAME may have been timed to it. The core rejects anything outside 1..1000,
+  // and the page paces itself off what the core actually accepted.
+  var REFRESH_HZ = 50;
+  if (CFG.refreshHz !== undefined) {
+    var hz = Number(CFG.refreshHz);
+    if (isFinite(hz) && Math.floor(hz) === hz && hz >= 1 && hz <= 1000)
+      REFRESH_HZ = hz;
+    else
+      warn('config.js refreshHz is ' + JSON.stringify(CFG.refreshHz)
+           + ', which is not a whole number of Hz between 1 and 1000 — using 50');
+  }
+
+  // How loud the modem's monitor output is. The machine's own signal is
+  // full-scale -- the beep is a square wave that reaches both rails -- so 1
+  // would be as loud as the browser can make it; this is a level that sits
+  // alongside everything else on a page. 0 keeps the audio hardware asleep.
+  var VOLUME = 0.35;
+  if (CFG.volume !== undefined) {
+    var vol = Number(CFG.volume);
+    if (isFinite(vol) && vol >= 0 && vol <= 1)
+      VOLUME = vol;
+    else
+      warn('config.js volume is ' + JSON.stringify(CFG.volume)
+           + ', which is not a number between 0 and 1 — using ' + VOLUME);
+  }
+
+  // The colour of the plastic moulding around the tube, as a CSS hex string.
+  // These are display-referred values written straight to the framebuffer, so
+  // the channels map to the shader by /255 with no transfer function applied.
+  var BEZEL_RGB = [0.070, 0.072, 0.082];   // near-black, slightly blue
+  if (CFG.bezelColor !== undefined) {
+    var hex = String(CFG.bezelColor).replace(/^#/, "");
+    if (/^[0-9a-fA-F]{3}$/.test(hex))
+      hex = hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2];
+    if (/^[0-9a-fA-F]{6}$/.test(hex))
+      BEZEL_RGB = [
+        parseInt(hex.slice(0, 2), 16) / 255,
+        parseInt(hex.slice(2, 4), 16) / 255,
+        parseInt(hex.slice(4, 6), 16) / 255
+      ];
+    else
+      warn('config.js bezelColor is ' + JSON.stringify(CFG.bezelColor)
+           + ', which is not a "#rgb" or "#rrggbb" colour — using the default');
+  }
+
+  // The display modes, in the order the shortcut walks them: the presentation
+  // stripped away a layer at a time -- the whole machine, then the tube alone,
+  // then the raw image -- each in monochrome before colour. The bezel is drawn
+  // over the CRT pipeline's margin, so it needs that pipeline and there is no
+  // fourth pair.
+  var MODE_LIST = [
+    { name: "bezel",       crt: true,  bezel: true,  color: false },
+    { name: "bezel-color", crt: true,  bezel: true,  color: true  },
+    { name: "tube",        crt: true,  bezel: false, color: false },
+    { name: "tube-color",  crt: true,  bezel: false, color: true  },
+    { name: "flat",        crt: false, bezel: false, color: false },
+    { name: "flat-color",  crt: false, bezel: false, color: true  }
+  ];
+
+  // Which one to start in, for a visitor who has not already chosen. Named
+  // rather than numbered so the config file says what it means.
+  var DEFAULT_MODE = MODE_LIST[0];
+  if (CFG.displayMode !== undefined) {
+    var want = String(CFG.displayMode);
+    var found = null;
+    for (var mi = 0; mi < MODE_LIST.length; mi++)
+      if (MODE_LIST[mi].name === want) found = MODE_LIST[mi];
+    if (found) DEFAULT_MODE = found;
+    else
+      warn('config.js displayMode is ' + JSON.stringify(CFG.displayMode)
+           + ', which is not one of: '
+           + MODE_LIST.map(function (m) { return m.name; }).join(", "));
+  }
+
+  // ---------------------------------------------------------------------
+  // The ROMs on offer, from config.js. An entry is either a file name or a
+  // { name, file } pair; without a name the file's own, stripped of its
+  // extension, labels it in the menu. With nothing configured the page looks
+  // for rom.bin next to itself, which is how a single game ships.
+  // ---------------------------------------------------------------------
+  var ROMS = [];
+  if (CFG.roms !== undefined) {
+    (Array.isArray(CFG.roms) ? CFG.roms : [CFG.roms]).forEach(function (entry) {
+      var file = typeof entry === "string" ? entry
+                 : (entry && typeof entry === "object" ? entry.file : null);
+      if (!file) {
+        warn("config.js has a roms entry that names no file: "
+             + JSON.stringify(entry));
+        return;
+      }
+      file = String(file);
+      var name = (entry && entry.name !== undefined) ? String(entry.name)
+                 : file.replace(/^.*\//, "").replace(/\.[^.]*$/, "");
+      ROMS.push({ name: name, file: file, bytes: null });
+    });
+    if (!ROMS.length)
+      warn("config.js roms lists nothing loadable — looking for rom.bin");
+  }
+  if (!ROMS.length) ROMS = [{ name: "rom", file: "rom.bin", bytes: null }];
+
+  // The 24C02 is the machine's own EEPROM, but a native ROM is free to keep
+  // whatever it likes in there, so two games sharing one 256-byte image would
+  // overwrite each other. Each ROM gets its own, keyed by file name -- except
+  // rom.bin, which keeps the plain key a single published game has been
+  // saving under all along.
+  var NVRAM_KEY = "minitel2.nvram";
+
+  function nvramKey(file) {
+    return file === "rom.bin" ? "minitel2.nvram" : "minitel2.nvram:" + file;
+  }
+
+  // Which of the ROMs the visitor last ran. Only the starting point, and only
+  // consulted when there is a menu to have chosen from.
+  var ROM_KEY = "minitel2.rom";
+  var romIndex = 0;
+  if (ROMS.length > 1) {
+    try {
+      var lastRom = localStorage.getItem(ROM_KEY);
+      for (var qi = 0; qi < ROMS.length; qi++)
+        if (ROMS[qi].file === lastRom) romIndex = qi;
+    } catch (e) { /* storage unavailable: start where config.js says */ }
+  }
+
+  // Opening the page with ?fps shows what the pacing settled on: the machine's
+  // speed against the wall clock, emulated frames per second, the display rate
+  // it locked to, and what one emulated frame plus its blit actually costs.
+  var fps = null;
+  if (/(^|[?&])fps($|[&=])/.test(location.search)) {
+    var el = document.createElement("div");
+    el.style.cssText = "position:fixed;top:6px;left:8px;font:11px ui-monospace,monospace;" +
+                       "color:#9f8;background:#0009;padding:3px 6px;border-radius:4px";
+    document.body.appendChild(el);
+    fps = {
+      t0: 0, emu: 0, ticks: 0, busy: 0,
+      tick: function (now, ran) {
+        if (!this.t0) { this.t0 = now; return; }
+        this.emu += ran;
+        this.ticks++;
+        if (now - this.t0 >= 500) {
+          var secs = (now - this.t0) / 1000;
+          // The machine is meant to advance MACHINE_HZ frames per real second;
+          // anything else is the browser not keeping up, and is what "the game
+          // runs slow" actually means.
+          var speed = (this.emu / secs) / MACHINE_HZ * 100;
+          el.textContent =
+            "speed " + speed.toFixed(0) + "%  " +
+            (this.emu / secs).toFixed(1) + " fps  display " +
+            (this.ticks / secs).toFixed(0) + "Hz  ratio " + pacer.ratio().toFixed(3) +
+            "  owed " + pacer.owed().toFixed(2) +
+            "  " + (this.busy / Math.max(this.emu, 1)).toFixed(2) + "ms/frame";
+          el.style.color = speed > 90 ? "#9f8" : speed > 70 ? "#fd7" : "#f88";
+          this.t0 = now; this.emu = 0; this.ticks = 0; this.busy = 0;
+        }
+      }
+    };
+  }
+
+  var canvas = document.getElementById("screen");
+  var drop = document.getElementById("drop");
+  var Module = null, api = null, heap = null, heapf = null, running = false;
+  var view = null, viewAt = -1, viewLen = 0;
+
+  function bind(mod) {
+    return {
+      reset: mod._mt_reset,
+      romBuffer: mod._mt_rom_buffer,
+      romBufferSize: mod._mt_rom_buffer_size,
+      loadRom: mod._mt_load_rom,
+      runFrame: mod._mt_run_frame,
+      width: mod._mt_width,
+      height: mod._mt_height,
+      rgba: mod._mt_rgba,
+      setKey: mod._mt_set_key,
+      releaseAll: mod._mt_release_all_keys,
+      setColor: mod._mt_set_color,
+      setRefreshHz: mod._mt_set_refresh_hz,
+      refreshHz: mod._mt_refresh_hz,
+      setAudioRate: mod._mt_set_audio_rate,
+      audioRate: mod._mt_audio_rate,
+      audioBuffer: mod._mt_audio_buffer,
+      audioRead: mod._mt_audio_read,
+      nvram: mod._mt_nvram,
+      nvramSize: mod._mt_nvram_size
+    };
+  }
+
+  // ---------------------------------------------------------------------
+  // ROM loading
+  // ---------------------------------------------------------------------
+  function loadRom(bytes, file) {
+    // The EEPROM of whatever was running, before the image that owns it is
+    // replaced. Nothing has run yet on the first load, so there is nothing to
+    // write and the blank 256 bytes must not be saved over a real one.
+    if (running) saveNvram();
+
+    var max = api.romBufferSize();
+    if (bytes.length > max) bytes = bytes.subarray(0, max);
+    heap.set(bytes, api.romBuffer());
+    NVRAM_KEY = nvramKey(file);
+    api.loadRom(bytes.length);   // resets the machine, EEPROM included
+    restoreNvram();
+
+    // A key held across the swap would be held down on a machine that has just
+    // come up, and the new ROM would never see it released.
+    releaseEverything();
+
+    drop.classList.remove("on");
+    if (!running) { running = true; requestAnimationFrame(frame); }
+  }
+
+  function askForRom() { drop.classList.add("on"); }
+
+  // A dropped file is bytes the page already holds; anything from config.js is
+  // fetched, and a host that answers a missing file with an HTML page counts as
+  // missing.
+  function fetchRom(rom) {
+    if (rom.bytes) {
+      loadRom(rom.bytes, rom.file);
+      return Promise.resolve();
+    }
+    return fetch(rom.file, { cache: "no-cache" })
+      .then(function (r) { return r.ok ? r.arrayBuffer() : Promise.reject(); })
+      .then(function (b) {
+        var bytes = new Uint8Array(b);
+        if (!bytes.length || bytes[0] === 0x3c) return Promise.reject();
+        loadRom(bytes, rom.file);
+      });
+  }
+
+  // ---------------------------------------------------------------------
+  // The ROM menu, which exists only when there is a choice to make.
+  // ---------------------------------------------------------------------
+  var menu = null;
+
+  function addOption(rom) {
+    var o = document.createElement("option");
+    o.textContent = rom.name;
+    menu.appendChild(o);
+    return o;
+  }
+
+  if (ROMS.length > 1) {
+    menu = document.getElementById("roms");
+    ROMS.forEach(addOption);
+    menu.selectedIndex = romIndex;
+    menu.classList.add("on");
+    menu.addEventListener("change", function () {
+      // Nothing has been chosen until it loads, so this reports only what the
+      // console already carries.
+      selectRom(menu.selectedIndex).catch(function () { });
+      // The menu keeps focus after a click, and the arrow keys are the
+      // Minitel's before they are the menu's.
+      menu.blur();
+      window.focus();
+    });
+  }
+
+  function setRomIndex(i) {
+    romIndex = i;
+    if (menu) menu.selectedIndex = i;
+  }
+
+  // Loading is what makes a choice real: a ROM that is not there leaves the
+  // machine running what it was, and the menu pointing at it.
+  function selectRom(i) {
+    var was = romIndex;
+    return fetchRom(ROMS[i]).then(function () {
+      setRomIndex(i);
+      // A dropped file is not in config.js and will not be there next visit.
+      if (!ROMS[i].bytes)
+        try { localStorage.setItem(ROM_KEY, ROMS[i].file); } catch (e) { }
+    }, function (e) {
+      warn('cannot load "' + ROMS[i].file + '"');
+      setRomIndex(was);
+      return Promise.reject(e);
+    });
+  }
+
+  // A dropped file is not one of the configured ROMs, but the menu is where a
+  // visitor looks to see what is running, so it takes a slot at the end of the
+  // list -- the same slot each time, for as long as the page is open.
+  var dropped = null;
+
+  function useDroppedRom(f) {
+    f.arrayBuffer().then(function (b) {
+      if (!dropped) {
+        dropped = { name: "", file: "", bytes: null };
+        ROMS.push(dropped);
+        if (menu) addOption(dropped);
+      }
+      dropped.name = dropped.file = f.name;
+      dropped.bytes = new Uint8Array(b);
+      if (menu) menu.options[ROMS.length - 1].textContent = dropped.name;
+      selectRom(ROMS.length - 1).catch(function () { });
+    });
+  }
+
+  document.getElementById("file").addEventListener("change", function (e) {
+    var f = e.target.files[0];
+    if (f) useDroppedRom(f);
+  });
+
+  ["dragenter", "dragover"].forEach(function (t) {
+    window.addEventListener(t, function (e) { e.preventDefault(); drop.classList.add("on"); });
+  });
+  window.addEventListener("drop", function (e) {
+    e.preventDefault();
+    var f = e.dataTransfer.files[0];
+    if (f) useDroppedRom(f);
+  });
+
+  // ---------------------------------------------------------------------
+  // NVRAM (the 24C02 the Minitel keeps its settings in)
+  // ---------------------------------------------------------------------
+  function restoreNvram() {
+    try {
+      var saved = localStorage.getItem(NVRAM_KEY);
+      if (!saved) return;
+      var bytes = Uint8Array.from(atob(saved), function (c) { return c.charCodeAt(0); });
+      if (bytes.length === api.nvramSize()) heap.set(bytes, api.nvram());
+    } catch (e) { /* private mode, cleared storage: start with a blank EEPROM */ }
+  }
+
+  function saveNvram() {
+    try {
+      var ptr = api.nvram(), n = api.nvramSize();
+      var s = "";
+      for (var i = 0; i < n; i++) s += String.fromCharCode(heap[ptr + i]);
+      localStorage.setItem(NVRAM_KEY, btoa(s));
+    } catch (e) { /* nothing we can do; the machine still runs */ }
+  }
+
+  window.addEventListener("pagehide", saveNvram);
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) saveNvram();
+  });
+
+  // ---------------------------------------------------------------------
+  // Sound.
+  //
+  // The Minitel's speaker is the modem's monitor output, and the core hands
+  // over what it carried, one emulated frame of samples at a time. Those go
+  // out as a queue of short buffers scheduled back to back against the audio
+  // clock: no worklet and no ScriptProcessor, because the machine is already
+  // being driven from the animation frame and the audio it just produced can
+  // simply be handed to the mixer at the same cadence, a little ahead of when
+  // it is due.
+  //
+  // That lead is the whole latency budget, and it exists because the audio
+  // clock does not wait for the page: it has to cover the longest gap between
+  // two animation frames -- a compositor hiccup, a slow frame, a collection --
+  // or the queue runs dry and the tone breaks up. A tenth of a second covers
+  // that with room left, and is short enough that a key and its tone still
+  // land together.
+  // ---------------------------------------------------------------------
+  function createAudio(volume) {
+    var LEAD = 0.10;        // how far ahead of the clock the queue is kept
+    var MIN_LEAD = 0.02;    // below this the next block would be scheduled late
+    var MAX_LEAD = 0.40;    // above it the page has run away from the clock
+
+    var ctx = null, gain = null, rate = 0, playAt = 0;
+    var off = false;        // no audio at all: not asked for, or not available
+
+    function open() {
+      if (off || ctx) return;
+
+      // volume 0 is the off switch, and it means the page never asks the
+      // browser for audio hardware at all.
+      if (!volume) { off = true; return; }
+
+      // A gesture can land before the module has finished loading. Leave it;
+      // boot opens the context itself, and the next gesture will start it.
+      if (!api) return;
+
+      var C = window.AudioContext || window.webkitAudioContext;
+      if (!C) { off = true; return; }
+      try {
+        // Older Safari's constructor takes no options object.
+        try { ctx = new C({ latencyHint: "interactive" }); }
+        catch (e) { ctx = new C(); }
+      } catch (e) {
+        warn("no audio: " + e);
+        off = true;
+        return;
+      }
+
+      gain = ctx.createGain();
+      gain.gain.value = volume;
+      gain.connect(ctx.destination);
+
+      // Generate at the mixer's own rate and nothing is resampled on the way
+      // out. The core keeps its own rate if it cannot work at that one, so
+      // read back what it settled on rather than assuming; the buffers carry
+      // that rate and the mixer resamples them if it has to.
+      api.setAudioRate(Math.round(ctx.sampleRate));
+      rate = api.audioRate();
+    }
+
+    function silent(at, n) {
+      for (var i = 0; i < n; i++)
+        if (heapf[at + i] !== 0) return false;
+      return true;
+    }
+
+    return {
+      // A browser will not start an audio context until the visitor has done
+      // something, and which gesture counts differs between them. Every one is
+      // another chance to try; once the context is running this does nothing.
+      unlock: function () {
+        open();
+        if (ctx && ctx.state !== "running") {
+          // Older Safari's resume() returns nothing rather than a promise.
+          var p = ctx.resume();
+          if (p && p.catch) p.catch(function () { /* not allowed yet; the next gesture tries again */ });
+        }
+      },
+
+      // Called once per animation frame, after the machine has run.
+      pump: function () {
+        if (off) return;
+
+        if (!ctx || ctx.state !== "running") {
+          // Nothing is listening yet. Still drain, so the core's buffer does
+          // not fill and start dropping, and so that when sound is finally
+          // allowed it starts from the machine's present rather than from a
+          // stale third of a second.
+          while (api.audioRead() > 0) { }
+          return;
+        }
+
+        var at = api.audioBuffer() >> 2;   // byte offset -> HEAPF32 index
+        var n;
+
+        while ((n = api.audioRead()) > 0) {
+          var now = ctx.currentTime;
+          if (playAt < now + MIN_LEAD || playAt > now + MAX_LEAD)
+            playAt = now + LEAD;
+
+          // Silence still advances the playhead -- that is what keeps one
+          // continuous timeline across a quiet passage, so a tone that starts
+          // needs no resynchronising -- but there is nothing to be gained by
+          // handing the mixer a buffer of zeros to play.
+          if (!silent(at, n)) {
+            var buf = ctx.createBuffer(1, n, rate);
+            buf.getChannelData(0).set(heapf.subarray(at, at + n));
+            var src = ctx.createBufferSource();
+            src.buffer = buf;
+            src.connect(gain);
+            src.start(playAt);
+          }
+
+          playAt += n / rate;
+        }
+      }
+    };
+  }
+
+  var audio = createAudio(VOLUME);
+
+  // ---------------------------------------------------------------------
+  // Main loop.
+  //
+  // The machine is paced off the display's own cadence rather than off wall
+  // clock deltas. A millisecond accumulator has to compare each delta against
+  // a 16.667 ms frame time, and on a 60 Hz display the delta lands either side
+  // of that constantly: every time it falls short the tick renders nothing and
+  // the next one runs two frames, which reads as judder even though the
+  // average rate is correct. Counting animation frames against a measured
+  // display ratio instead gives exactly one emulated frame per tick at 60 Hz,
+  // one every other tick at 120 Hz, and an even 60-in-144 pattern at 144 Hz.
+  // ---------------------------------------------------------------------
+  // The Minitel's tube is 50 Hz; see minitel.h. config.js can override it, and
+  // boot replaces this with the rate the core confirmed it is running at.
+  var MACHINE_HZ = REFRESH_HZ;
+
+  // ---------------------------------------------------------------------
+  // Pacer: given the timestamp of an animation frame, says how many emulated
+  // frames to run for it. Self-contained and free of DOM or module state, so
+  // it can be replayed against recorded timestamp streams in a test.
+  // ---------------------------------------------------------------------
+  function createPacer(machineHz) {
+    var FRAME_MS = 1000 / machineHz;
+    var TICK_WINDOW = 60;
+
+    var ratio = 1;            // emulated frames per animation frame
+    var acc = 0;
+    var owed = 0;             // frames real time says we still owe the machine
+    var prevTick = 0;
+    var deltas = [];
+
+    // The display rate is taken from the MEDIAN gap between callbacks, never
+    // the mean. Browsers deliver bursts of coalesced callbacks after a
+    // compositor catch-up, and a mean over a window holding one reads as a far
+    // higher refresh than the display has -- which would lock the machine to a
+    // fraction of its speed until the next measurement. A median ignores both
+    // bursts and stalls, however long they are, as long as they are a minority
+    // of the window.
+    function median(a) {
+      var b = a.slice().sort(function (x, y) { return x - y; });
+      return b[b.length >> 1];
+    }
+
+    function relock() {
+      var hz = 1000 / median(deltas);
+      deltas.length = 0;
+      if (!(hz >= 20 && hz <= 400)) return;    // not a plausible display
+
+      var r = machineHz / hz;
+      // Snap to an exact 1/k when the display is a whole multiple of the
+      // machine's rate, so the common cases carry no rounding error at all.
+      var k = Math.round(hz / machineHz);
+      if (k >= 1 && Math.abs(hz - k * machineHz) < 3) r = 1 / k;
+      ratio = r;
+    }
+
+    return {
+      tick: function (now) {
+        var dt = prevTick ? now - prevTick : 0;
+        prevTick = now;
+
+        if (dt > 0) {
+          deltas.push(dt);
+          if (deltas.length >= TICK_WINDOW) relock();
+        }
+
+        // The tick count sets the cadence; real elapsed time sets the speed.
+        // Drift builds only when the display is not delivering the rate we
+        // locked to, or when that lock is simply wrong, and it is paid back a
+        // frame at a time so a hiccup never becomes a burst. This is also the
+        // safety net: however badly the cadence is misread, wall time pulls
+        // the machine back to the right speed within a few frames.
+        if (dt > 0 && dt < 250) {
+          owed += dt / FRAME_MS - ratio;
+          if (owed > 3) owed = 3;
+          else if (owed < -3) owed = -3;
+        } else {
+          owed = 0;             // a real stall; do not try to make it up
+        }
+
+        acc += ratio;
+        if (owed > 1.5) { acc += 1; owed -= 1; }
+        else if (owed < -1.5) { acc -= 1; owed += 1; }
+
+        var n = 0;
+        while (acc >= 1 && n < 4) { acc -= 1; n++; }
+        if (acc > 1) acc = 1;   // hit the cap: drop the debt rather than spiral
+        return n;
+      },
+      ratio: function () { return ratio; },
+      owed: function () { return owed; }
+    };
+  }
+
+  var pacer = createPacer(MACHINE_HZ);
+
+  // =====================================================================
+  // Renderer
+  //
+  // One WebGL context whose CRT pipeline can be switched off, rather than two
+  // canvases: a canvas only ever gets one context type, so this way toggling
+  // cannot fail halfway. Without WebGL we fall back to a 2D canvas and the
+  // toggle simply has nothing to switch.
+  //
+  // In CRT mode, three passes at source resolution feed one at display
+  // resolution:
+  //   persist   phosphor -- max(current, previous * decay), ping-ponged
+  //   blur x2   separable gaussian, which becomes the bloom
+  //   composite curvature, scanlines, tint, bloom, vignette -> the screen
+  // In plain mode the first three are skipped and the composite samples the
+  // source directly with nearest filtering, which is pixel-for-pixel what the
+  // 2D path draws.
+  // =====================================================================
+
+  // Phosphor time constant. Decay is computed against elapsed milliseconds
+  // rather than per frame, so it does not shift with the display rate -- and
+  // so it is unaffected by MAME's driver declaring 60 Hz for a 50 Hz machine.
+  var PHOSPHOR_TAU_MS = 40;
+
+  // Step sizes, in source texels, for the chain of blurs that makes the wide
+  // light the bezel reflects. Each is within the support of the one before it.
+  var AMB_STEPS = [2, 4, 8];
+
+  // Bezel geometry. The ring -- the lit chamfer right next to the glass -- is
+  // generated from these numbers on the JavaScript side as real geometry, and
+  // the few a shader also needs are injected below, declared once rather than
+  // written out twice and left to drift apart. BORDER and BEVEL are not among
+  // them: the margin reaches the composite as the uBorder uniform, since it
+  // changes with the bezel, and the chamfer width is only ever used building
+  // the geometry.
+  var BEZ = {
+    // Margin around the tube, as a fraction of the canvas. Equal to BEVEL, so
+    // the chamfer IS the moulding: its outer edge lands exactly on the edge of
+    // the canvas, and its mitred corners exactly on the corners. There is no
+    // flat face beyond it -- that part caught no reflection and has been
+    // dropped, so anything wider than the chamfer would just be dead black.
+    BORDER: 0.036,
+    BEVEL:  0.036,      // width of the chamfer next to the glass, same units
+    SPILL:  0.80,       // plastic reflects a few percent of the light, not all
+    GAIN:   4.5,        // screen depth reflected per unit of distance outward
+    START:  0.06,       // skip the Minitel's own black margin
+    // Corner radius, as a fraction of the tube's height. Zero is a square
+    // corner, the two straight runs meeting on a diagonal seam -- a mitre
+    // joint, the way a real moulding is cut. See buildRing().
+    RADIUS: 0.0,
+    CURVE:  [6.4, 5.2]  // curvature divisors: x bows with y, y bows with x
+  };
+
+  // The page letterboxes the canvas to 4:3, and the composite derives the same
+  // aspect from the viewport, so a corner is a circle on screen.
+  var ASPECT = 4 / 3;
+
+  // The chamfer, in tube-space units.
+  var BAND = BEZ.BEVEL / (1.0 - 2.0 * BEZ.BORDER);
+
+  // How far the strip reaches back inside the picture, in chamfers, negative
+  // because it is the wrong side of the edge. The light has to have fallen to
+  // nothing by there, so the shader needs the same number and it is injected
+  // below.
+  //
+  // The limit is geometric. An offset curve inverts as soon as the offset
+  // passes the radius of curvature it is offsetting, and an inverted offset
+  // means folded, overlapping triangles -- under an additive blend, carrying
+  // reflection coordinates that no longer agree, which comes out as a fan of
+  // bright streaks from every corner. A corner is the tightest thing on the
+  // ring, so it sets the reach for all of it; the reach has to be the same
+  // everywhere, because a reach that *varies* quickly inverts the curve just
+  // as thoroughly as one that is too large.
+  //
+  // The corner is an ellipse in these coordinates, and its radius of curvature
+  // is smallest at the end of the major axis.
+  // Algebraically (R/A)^2 / R, written without the division so a square corner
+  // gives 0 rather than a NaN that would take the whole shader with it. At
+  // zero it is also the right answer: no inward offset, so nothing can invert.
+  var CORNER_R = BEZ.RADIUS / (ASPECT * ASPECT);
+  var INNER = -Math.min(0.15, 0.85 * CORNER_R / BAND);
+
+  // GLSL ES 1.00 has no implicit int-to-float conversion, so a whole number has
+  // to be written with a decimal point or the shader will not compile.
+  function glf(x) { return (x % 1 === 0) ? x.toFixed(1) : String(x); }
+  function glf5(x) { return x.toFixed(5); }
+
+  var GLSL_BEZEL = [
+    "const vec3  BEZEL  = vec3(" + BEZEL_RGB.map(glf5).join(", ") + ");",
+    "const float INNER  = " + INNER.toFixed(5) + ";",
+    "const float SPILL  = " + glf(BEZ.SPILL) + ";",
+    "const float RADIUS = " + glf(BEZ.RADIUS) + ";",
+    "const vec2  CURVE  = vec2(" + glf(BEZ.CURVE[0]) + ", " + glf(BEZ.CURVE[1]) + ");",
+    "vec2 curve(vec2 uv, float amt) {",
+    "  uv = uv * 2.0 - 1.0;",
+    "  vec2 off = abs(uv.yx) / CURVE;",
+    "  uv += uv * off * off * amt;",
+    "  return uv * 0.5 + 0.5;",
+    "}"
+  ].join("\n");
+
+  // Screen-space dither. The vignette, the bloom and the reflection are all
+  // smooth low-amplitude gradients, and 8 bits per channel is not enough to
+  // hold them without visible contouring.
+  //
+  // The noise is interleaved gradient noise (Jimenez), sampled twice and
+  // subtracted to make the distribution triangular over +/-1 LSB. Rectangular
+  // noise at +/-0.5 LSB -- one sample, which is what this used to be -- hides
+  // the contour but leaves the quantisation error correlated with the signal,
+  // so wherever the gradient sits near the middle of a step the residue
+  // reappears as a faint band. Triangular noise decorrelates it completely:
+  // that is the whole reason dither is specified this way in audio, and the
+  // reason a gradient this shallow still showed bands after the first attempt.
+  //
+  // What matters besides the distribution is where the noise puts its energy.
+  // A plain hash is white, with as much energy at the low spatial frequencies
+  // the eye is most sensitive to as anywhere else, so it clumps; this has
+  // measurably less low-frequency content for slightly less arithmetic.
+  //
+  // One value for all three channels, so the grain is neutral rather than
+  // coloured speckle on what should be an even tint.
+  var GLSL_DITHER = [
+    "vec3 screenSpaceDither(vec2 pos) {",
+    // vec2(47.0, 17.0) * 0.695 is the offset the noise is designed to be
+    // animated by; it decorrelates successive frames instead of sliding the
+    // pattern across the screen. The second sample walks the lattice the other
+    // way, on transposed coordinates, so the two are independent rather than
+    // one being a shifted copy of the other.
+    "  HIGHP vec2 a = pos + uTime * vec2(32.665, 11.815);",
+    "  HIGHP vec2 b = pos.yx + uTime * vec2(11.815, 32.665) + vec2(17.0, 5.0);",
+    "  HIGHP vec2 k = vec2(0.06711056, 0.00583715);",
+    "  HIGHP float u = fract(52.9829189 * fract(dot(a, k)));",
+    "  HIGHP float v = fract(52.9829189 * fract(dot(b, k)));",
+    // u + v - 1 is triangular over [-1, 1]; one LSB of an 8-bit channel is
+    // 1/255, not 1/256.
+    "  return vec3(u + v - 1.0) / 255.0;",
+    "}"
+  ].join("\n");
+
+  var VERT = [
+    "attribute vec2 aPos;",
+    "varying vec2 vUV;",
+    "void main() {",
+    "  vUV = aPos * 0.5 + 0.5;",
+    "  gl_Position = vec4(aPos, 0.0, 1.0);",
+    "}"
+  ].join("\n");
+
+  var FRAG_PERSIST = [
+    "precision mediump float;",
+    "varying vec2 vUV;",
+    "uniform sampler2D uSrc;",
+    "uniform sampler2D uPrev;",
+    "uniform float uDecay;",
+    "void main() {",
+    "  vec3 cur = texture2D(uSrc, vUV).rgb;",
+    // An 8-bit target cannot decay by multiplication alone: small values round
+    // back to themselves and the ghost never clears. Bleed a fixed step too.
+    "  vec3 prev = max(texture2D(uPrev, vUV).rgb * uDecay - 1.5 / 255.0, 0.0);",
+    "  gl_FragColor = vec4(max(cur, prev), 1.0);",
+    "}"
+  ].join("\n");
+
+  var FRAG_BLUR = [
+    "precision mediump float;",
+    "varying vec2 vUV;",
+    "uniform sampler2D uTex;",
+    "uniform vec2 uStep;",
+    "uniform float uEncode;",
+    // 5-tap gaussian using linear filtering to get 9 taps' worth of reach
+    "void main() {",
+    "  vec3 c = texture2D(uTex, vUV).rgb * 0.2270270270;",
+    "  c += (texture2D(uTex, vUV + uStep * 1.3846153846).rgb",
+    "      +  texture2D(uTex, vUV - uStep * 1.3846153846).rgb) * 0.3162162162;",
+    "  c += (texture2D(uTex, vUV + uStep * 3.2307692308).rgb",
+    "      +  texture2D(uTex, vUV - uStep * 3.2307692308).rgb) * 0.0702702703;",
+    // The last pass of the ambient chain stores its result already curved.
+    //
+    // Eight bits cannot hold the tail of a gaussian: below half a level it
+    // rounds to exactly zero, so the blur ends on a hard floor whose boundary
+    // is a straight line. The bezel reads that texture through pow(x, 0.7),
+    // whose slope at zero is infinite, so the reflection dives into the floor
+    // at maximum steepness and flattens -- and a slope discontinuity on an
+    // otherwise smooth gradient is a Mach band, which is exactly what you see:
+    // a straight edge where the light stops falling and another where it
+    // starts again.
+    //
+    // Applying the curve before storing rather than after reading spreads the
+    // codes over the dark end where they are needed, which is all gamma
+    // encoding has ever been for. It moves the level at which the blur rounds
+    // away entirely from 1/510 down to about 1.4e-4 -- 14 times further into
+    // the tail, where the gradient is 14 times shallower -- and it costs one
+    // pow at source resolution, since the pow it replaces was being done per
+    // output pixel anyway.
+    "  gl_FragColor = vec4(uEncode > 0.5 ? pow(max(c, 0.0), vec3(0.70)) : c, 1.0);",
+    "}"
+  ].join("\n");
+
+  var FRAG_COMPOSITE = [
+    // Coordinate maths runs over hundreds of texels, and fwidth() on mediump
+    // is poor on some mobile parts, so ask for highp where it exists.
+    "#ifdef GL_FRAGMENT_PRECISION_HIGH",
+    "precision highp float;",
+    "#define HIGHP highp",
+    "#else",
+    "precision mediump float;",
+    "#define HIGHP mediump",
+    "#endif",
+    "varying vec2 vUV;",
+    "uniform sampler2D uTex;",
+    "uniform sampler2D uBloom;",
+    "uniform vec2 uSrcSize;",
+    "uniform vec2 uPx;",         // one output pixel, in uv units
+    "uniform vec2 uFootprint;",  // texels per output pixel, if no derivatives
+    "uniform float uScale;",     // output pixels per source scanline
+    "uniform float uCrt;",       // 0 = plain, 1 = full effect
+    // The margin the moulding is drawn over, as a fraction of the canvas.
+    // Zero when there is no moulding, so the tube takes the space back.
+    "uniform float uBorder;",
+    "uniform float uTime;",      // animates the dither, wrapped to stay precise
+    "uniform float uColor;",    // 1 = picture is already in color
+    // The Minitel's tube is a blue-cyan monochrome phosphor on glass that is
+    // never quite black, even with the beam off.
+    "const vec3 PHOSPHOR = vec3(0.42, 0.86, 1.00);",
+    "const vec3 GLASS    = vec3(0.028, 0.044, 0.052);",
+    GLSL_BEZEL,
+    GLSL_DITHER,
+    // Anti-aliased pixel-art sampling. Snap towards texel centres, but ramp
+    // across each texel boundary over exactly one output pixel: the pixels stay
+    // hard-edged while the stair-stepping the curvature puts on near-horizontal
+    // lines disappears. The returned coordinate must be sampled with LINEAR
+    // filtering, which is what performs the blend.
+    "vec2 pixelAA(vec2 uv) {",
+    "  vec2 pix = uv * uSrcSize - 0.5;",
+    "#ifdef HAVE_DERIV",
+    "  vec2 w = fwidth(pix);",   // exact, and follows the curvature's stretch
+    "#else",
+    "  vec2 w = uFootprint;",
+    "#endif",
+    "  vec2 fl = floor(pix);",
+    "  vec2 fr = pix - fl;",
+    "  vec2 t = clamp((fr - 0.5) / max(w, vec2(1e-4)) + 0.5, 0.0, 1.0);",
+    "  t = t * t * (3.0 - 2.0 * t);",
+    "  return (fl + 0.5 + t) / uSrcSize;",
+    "}",
+    "void main() {",
+    // The frame buffer's first row is the top of the Minitel image, but GL puts
+    // v = 0 at the bottom of the default frame buffer, so image space is the
+    // vertical mirror of screen space. The passes that render into a texture
+    // read and write at the same coordinate and so are unaffected; only this
+    // one, which reaches the canvas, has to flip.
+    "  vec2 p = vec2(vUV.x, 1.0 - vUV.y);",
+    "  if (uCrt < 0.5) {",       // plain: nearest filtered, straight through
+    "    vec2 f = curve(p, 0.0);",
+    "    if (f.x < 0.0 || f.x > 1.0 || f.y < 0.0 || f.y > 1.0) {",
+    "      gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);",
+    "      return;",
+    "    }",
+    "    gl_FragColor = vec4(texture2D(uTex, f).rgb, 1.0);",
+    "    return;",
+    "  }",
+    // Everything below works in tube space: 0..1 spans the picture, and the
+    // margin around it is where the glass and bezel are.
+    "  float ts = 1.0 - 2.0 * uBorder;",
+    "  vec2 q  = (p - uBorder) / ts;",   // screen position; the tube spans 0..1
+    "  vec2 uv = curve(q, 1.0);",
+    "  vec2 suv = pixelAA(uv);",
+    // Limited video bandwidth softens horizontal edges on real hardware.
+    "  float tx = 1.0 / uSrcSize.x;",
+    "  vec3 c = texture2D(uTex, suv).rgb;",
+    "  vec3 l = texture2D(uTex, suv - vec2(tx, 0.0)).rgb;",
+    "  vec3 r = texture2D(uTex, suv + vec2(tx, 0.0)).rgb;",
+    "  c = mix(c, (c * 2.0 + l + r) * 0.25, 0.45);",
+    // In monochrome the palette is eight greys, so any channel carries the
+    // level and the tube's own phosphor supplies the color. In color mode the
+    // picture already has its own, so the tint is skipped.
+    "  vec3 beam = (uColor > 0.5) ? c : PHOSPHOR * c.r;",
+    "  vec3 halo = (uColor > 0.5) ? vec3(1.0) : vec3(0.80, 0.95, 1.0);",
+    // Scanlines only once the output has room for them. Below about 1.6x they
+    // alias into moire and read as a screen door rather than a tube.
+    "  float room = clamp((uScale * ts - 1.6) / 1.6, 0.0, 1.0);",
+    "  float s = sin(uv.y * uSrcSize.y * 3.14159265);",
+    "  float scan = mix(1.0, 0.45 + 0.55 * s * s, room * 0.7);",
+    "  vec3 col = beam * scan;",
+    // Bloom is added near-white so large bright areas saturate to white the
+    // way the moon does on the real tube, instead of clipping to cyan.
+    "  col += texture2D(uBloom, uv).rgb * halo * 0.65;",
+    "  col += GLASS;",
+    "  vec2 v = uv * (1.0 - uv);",
+    "  col *= pow(clamp(v.x * v.y * 16.0, 0.0, 1.0), 0.22);",
+    // The tube's corners are radiused, the way a real one's are. Measured as
+    // the signed distance to a rounded rectangle, which is exact everywhere,
+    // so the edge antialiases over a single pixel the whole way round instead
+    // of going hard at the corners -- and the curved screen edge needs that
+    // treatment or it is the one staircase left in the picture.
+    //
+    // Worked in units where a step is the same number of pixels on both axes,
+    // so the corner comes out a circle rather than an ellipse. The aspect
+    // comes from the viewport rather than being assumed, because buildRing()
+    // has to assume it and this is what would show if the two disagreed.
+    "  float asp = uPx.y / uPx.x;",
+    "  vec2 sq = vec2((uv.x - 0.5) * asp, uv.y - 0.5);",
+    "  vec2 dr = abs(sq) - (vec2(0.5 * asp, 0.5) - RADIUS);",
+    "  float sd = (length(max(dr, 0.0)) + min(max(dr.x, dr.y), 0.0) - RADIUS)",
+    "           * ts / uPx.y;",
+    "  float inside = clamp(0.5 - sd, 0.0, 1.0);",
+    // Outside the picture there is nothing to draw. The moulding used to carry
+    // a flat face out here as well, but it pointed at the viewer rather than
+    // at the screen and so caught almost none of the picture -- a shallow
+    // gradient and no reflection at all. Everything that does catch the
+    // picture is the chamfer, drawn afterwards as its own geometry over this
+    // margin; see buildRing().
+    "  col = col * inside;",
+    "  col += screenSpaceDither(gl_FragCoord.xy);",
+    "  gl_FragColor = vec4(col, 1.0);",
+    "}"
+  ].join("\n");
+
+  // =====================================================================
+  // The inner bezel, as geometry
+  //
+  // The chamfer right next to the glass is the only part of the moulding that
+  // carries a real reflection: it faces the picture almost edge-on, so the
+  // whole screen is squeezed into a few millimetres of plastic. Computing that
+  // in the composite meant every pixel of the canvas ran the mirror mapping
+  // and two texture fetches to find out it was inside the picture and throw
+  // the answer away -- and it meant the band had to be found by clamping and
+  // max()ing screen coordinates, which is where the straight lines cutting
+  // across the reflection came from: those were the seams of the clamp, not
+  // anything in the picture.
+  //
+  // Drawing it as a triangle strip that follows the tube instead removes both
+  // problems. The strip is a closed ring: for each point along the edge of the
+  // picture it emits a vertex on the glass and one BEVEL further out, and the
+  // rasteriser interpolates between them. There is no region test at all, and
+  // the reflected coordinate is exact rather than reconstructed.
+  // =====================================================================
+
+  var RING_VERT = [
+    "attribute vec2 aPos;",   // clip space
+    "attribute vec2 aRefl;",  // tube-space point this vertex reflects
+    "attribute vec2 aInfo;",  // x: 0 at the glass, 1 at the outer edge; y: tone
+    "varying vec2 vRefl;",
+    "varying vec2 vInfo;",
+    "void main() {",
+    "  vRefl = aRefl;",
+    "  vInfo = aInfo;",
+    "  gl_Position = vec4(aPos, 0.0, 1.0);",
+    "}"
+  ].join("\n");
+
+  var FRAG_RING = [
+    "#ifdef GL_FRAGMENT_PRECISION_HIGH",
+    "precision highp float;",
+    "#define HIGHP highp",
+    "#else",
+    "precision mediump float;",
+    "#define HIGHP mediump",
+    "#endif",
+    "varying vec2 vRefl;",
+    "varying vec2 vInfo;",
+    "uniform sampler2D uBloom;",
+    "uniform sampler2D uAmb;",
+    "uniform vec3 uHalo;",
+    "uniform float uTime;",
+    GLSL_BEZEL,
+    GLSL_DITHER,
+    "void main() {",
+    // aRefl is a straight line in tube space, so interpolating it across the
+    // band is exact; the curvature is applied here, per pixel, which is what
+    // makes the reflection bow with the tube instead of merely following its
+    // outline.
+    "  vec2 r = clamp(curve(vRefl, 1.0), 0.0, 1.0);",
+    "  float d = vInfo.x;",
+    // The mirror is a heavy minification -- the whole picture inside a band a
+    // few pixels wide -- and bilinear filtering alone aliases badly under
+    // that, turning the picture's rows into hard bands. Read it mostly from
+    // the wide blur, which is the low-pass that needs; the depth comes from
+    // the mapping, not from sharpness.
+    // uAmb arrives already curved; the bloom does not, so it is curved here to
+    // match. Its share is a tenth at most, so the infinite slope this has at
+    // zero costs half a level rather than five.
+    "  vec3 amb = mix(pow(max(texture2D(uBloom, r).rgb, 0.0), vec3(0.70)),",
+    "                 texture2D(uAmb, r).rgb, 0.90 + 0.10 * d);",
+    // The window. It reaches zero with zero slope at both ends of the strip,
+    // which is what keeps the geometry invisible: the strip runs from d =
+    // -0.15 to d = 1, and there is no light at either. Physically both ends
+    // are right too -- inside is the shadow gap where the glass meets the
+    // plastic, and outside is the flat face, which points at the viewer rather
+    // than at the screen and so catches almost nothing.
+    "  float fall = smoothstep(INNER, 0.15, d) * (1.0 - smoothstep(0.30, 1.0, d));",
+    "  vec3 lit = amb * uHalo * SPILL * mix(1.0, vInfo.y, 0.35) * fall;",
+    // The chamfer is also a different face of the plastic from the flat one
+    // the composite laid down -- turned towards the screen, so the top of the
+    // frame is in shadow and the bottom catches the light. That difference is
+    // added rather than switched on, and faded out before the strip ends, so
+    // the moulding reads as a moulding without a hard edge anywhere.
+    "  vec3 face = BEZEL * (vInfo.y - 1.0)",
+    "           * smoothstep(INNER, 0.0, d) * (1.0 - smoothstep(0.45, 1.0, d));",
+    // Blended additively onto the plastic the composite already laid down, so
+    // this pass has to carry its own dither: its gradient is quantised on the
+    // way into the frame buffer whatever the composite did. Offset, because
+    // the noise is a function of the pixel and the frame -- unshifted it would
+    // return the identical value the composite already added at this pixel,
+    // and adding a number to itself is not a second dither, just a louder one.
+    "  gl_FragColor = vec4(lit + face",
+    "                    + screenSpaceDither(gl_FragCoord.xy + vec2(101.0, 37.0)), 1.0);",
+    "}"
+  ].join("\n");
+
+  // curve()'s inverse, by fixed-point iteration. Each axis bows by a factor
+  // that depends only on the other one, and those factors are at most about
+  // 0.15, so substituting the current estimate back in converges in a handful
+  // of rounds -- well under a millisecond for the whole ring, which is built
+  // once.
+  function uncurve(x, y) {
+    var tx = x * 2.0 - 1.0, ty = y * 2.0 - 1.0;
+    var qx = tx, qy = ty;
+    for (var i = 0; i < 24; i++) {
+      var ox = Math.abs(qy) / BEZ.CURVE[0];
+      var oy = Math.abs(qx) / BEZ.CURVE[1];
+      qx = tx / (1.0 + ox * ox);
+      qy = ty / (1.0 + oy * oy);
+    }
+    return [qx * 0.5 + 0.5, qy * 0.5 + 0.5];
+  }
+
+  // Vertices for the ring, as a triangle strip: 6 floats each, inner and outer
+  // alternating. The geometry is in canvas fractions throughout, so it does
+  // not depend on the canvas size and is built exactly once.
+  function buildRing() {
+    // Ribs go at a fixed spacing along the edge rather than a fixed count per
+    // side, so a corner is resolved as finely as a straight run. The strip's
+    // attributes are interpolated linearly between ribs, and where the shading
+    // normal turns fastest -- through a corner -- twenty pixels between ribs
+    // facets the light into visibly straight segments with a step where they
+    // meet. Measured in tube heights, and set against the tallest drawing
+    // buffer the page will make (1440 px), because the strip is built once in
+    // canvas fractions and reused at every size.
+    var SPACING = 0.003;
+    // How far the light's corner is spread, in the same units. The geometry's
+    // corner is BEZ.RADIUS; this is deliberately much larger.
+    var SHADE_BLUR = 0.010;
+    var ts = 1.0 - 2.0 * BEZ.BORDER;
+    var band = BAND;
+    // Both edges of the strip are geometry, and with no multisampling any
+    // brightness step across geometry is a staircase -- which is what the
+    // outer edge of the first attempt looked like. So the strip is made wider
+    // than the light it carries and the light is windowed to nothing before
+    // either edge. It reaches INNER chamfers past the edge of the picture:
+    // those rows are dark anyway, and the ramp across them is the shadow gap
+    // where the tube meets the moulding.
+
+    // One rib of the strip per entry: a point on the edge of the picture and
+    // the outward normal there, which is also the direction its reflection
+    // looks along. The edge is a rounded rectangle, so a corner is an arc of
+    // ribs whose normal turns through it rather than a joint.
+    //
+    // Rounding is what makes the corner work at all. Mitring it -- two ribs at
+    // the same point with different faces -- leaves a visible sharp point, and
+    // turning the face at a single point instead, which is the obvious
+    // alternative, rotates the reflected ray through ninety degrees with
+    // nowhere to put it: a quarter-circle arc a quarter of the screen across
+    // ends up squeezed into a corner a couple of pixels wide, and it aliases
+    // into a spray of bright specks. Along an arc the origin moves as the ray
+    // turns, so the same sweep is spread over the whole corner.
+    //
+    // The corner is a circle on screen, so an ellipse here.
+    var rx = BEZ.RADIUS / ASPECT, ry = BEZ.RADIUS;
+
+    var ribs = [];
+    function steps(len) { return Math.max(4, Math.ceil(len / SPACING)); }
+
+    function side(ax, ay, bx, by, nx, ny) {
+      var dx = (bx - ax) * ASPECT, dy = by - ay;
+      var n = steps(Math.sqrt(dx * dx + dy * dy));
+      for (var i = 0; i <= n; i++) {
+        var t = i / n;
+        ribs.push([ax + (bx - ax) * t, ay + (by - ay) * t, nx, ny]);
+      }
+    }
+    // Interior points only: the ends of an arc are the ends of the straight
+    // runs either side of it.
+    function arc(cx, cy, a0, a1) {
+      // A square corner has no arc. Falling through would emit a handful of
+      // ribs at one point whose normals sweep ninety degrees between them,
+      // which is the degenerate case this whole arc exists to avoid.
+      if (rx === 0 && ry === 0) return;
+      var n = steps(Math.abs(a1 - a0) * BEZ.RADIUS);
+      for (var i = 1; i < n; i++) {
+        var a = a0 + (a1 - a0) * (i / n);
+        var c = Math.cos(a), sn = Math.sin(a);
+        ribs.push([cx + rx * c, cy + ry * sn, c / ASPECT, sn]);
+      }
+    }
+    var H = Math.PI * 0.5;
+    side(rx, 0, 1 - rx, 0,  0, -1);   arc(1 - rx, ry,     -H, 0);
+    side(1, ry, 1, 1 - ry,  1,  0);   arc(1 - rx, 1 - ry,  0, H);
+    side(1 - rx, 1, rx, 1,  0,  1);   arc(rx,     1 - ry,  H, 2 * H);
+    side(0, 1 - ry, 0, ry, -1,  0);   arc(rx,     ry,  2 * H, 3 * H);
+    // A square corner leaves the two straight runs ending and beginning at the
+    // same point with faces ninety degrees apart. Cut them as a mitre: both
+    // ribs stay on the inner corner and both push their outer vertex to the
+    // OUTER corner of the moulding, along the sum of the two faces -- which is
+    // sqrt(2) chamfers long for perpendicular sides, hence the scale.
+    //
+    // That makes the two ribs geometrically identical, so the quad between
+    // them has no area and nothing is drawn across the joint. What is left is
+    // the last quad of one side and the first of the next, meeting along the
+    // diagonal from the inner corner to the outer one: the seam. Each keeps
+    // its own face, so the two sides shade and reflect differently right up to
+    // that line and change across it in one step.
+    //
+    // A rounded corner has no coincident ribs, so this is a no-op there.
+    //
+    // Ribs are [x, y, faceX, faceY] and gain [shadeX, shadeY, scale] here:
+    // the face steers the geometry, the shade steers tone and reflection, and
+    // they part company only at a mitre.
+    function mitre(a, b) {
+      var gx = a[2] + b[2], gy = a[3] + b[3];
+      var g = Math.sqrt(gx * gx + gy * gy) || 1.0;
+      return [
+        [a[0], a[1], gx / g, gy / g, a[2], a[3], g],
+        [a[0], a[1], gx / g, gy / g, b[2], b[3], g]
+      ];
+    }
+    function same(a, b) { return a[0] === b[0] && a[1] === b[1]; }
+
+    for (var ci = ribs.length - 1; ci > 0; ci--) {
+      if (same(ribs[ci], ribs[ci - 1])) {
+        var pair = mitre(ribs[ci - 1], ribs[ci]);
+        ribs[ci - 1] = pair[0];
+        ribs[ci] = pair[1];
+      }
+    }
+    // The seam at the join is a corner too, with its two faces at opposite
+    // ends of the array: the last rib closes the final side, the first opens
+    // the first one.
+    if (ribs.length > 1 && same(ribs[0], ribs[ribs.length - 1])) {
+      var ends = mitre(ribs[ribs.length - 1], ribs[0]);
+      ribs[ribs.length - 1] = ends[0];
+      ribs[0] = ends[1];
+    }
+
+    ribs.push(ribs[0]);         // close the ring
+
+    // Which way a direction on the edge of the picture points once the
+    // curvature has been undone. Measured rather than derived: the bow is
+    // steep enough at the corners that assuming the normal stays axis-aligned
+    // would leave the band visibly wider on one side of a corner than the
+    // other.
+    function towards(q, ux, uy, dx, dy) {
+      var t = uncurve(ux + dx * 1e-3, uy + dy * 1e-3);
+      var ax = t[0] - q[0], ay = t[1] - q[1];
+      var len = Math.sqrt(ax * ax + ay * ay) || 1.0;
+      return [ax / len, ay / len];
+    }
+
+    // Where every rib sits on screen, which way it faces, and -- separately --
+    // which way it shades. The two differ only at a mitre.
+    var qs = [], ns = [], sh = [];
+    for (var i = 0; i < ribs.length; i++) {
+      var e = ribs[i];
+      var q = uncurve(e[0], e[1]);
+      qs.push(q);
+      ns.push(towards(q, e[0], e[1], e[2], e[3]));
+      sh.push(e.length > 5 ? towards(q, e[0], e[1], e[4], e[5]) : ns[i]);
+    }
+
+    // Distance round the ring, in units where a step is the same number of
+    // pixels on either axis.
+    var m = ribs.length - 1;          // the last rib is the first, repeated
+    var arc = [0], total = 0;
+    for (var i = 1; i <= m; i++) {
+      var ax = (qs[i][0] - qs[i - 1][0]) * ASPECT, ay = qs[i][1] - qs[i - 1][1];
+      total += Math.sqrt(ax * ax + ay * ay);
+      arc.push(total);
+    }
+
+    // The shading normal: the same normal, blurred along the ring.
+    //
+    // The silhouette wants a tight radius; the light does not. An 8 px corner
+    // turns the normal through ninety degrees in about 13 px, and both the
+    // face tone and the reflection follow it, so the two points where the arc
+    // meets the straight runs read as creases -- you can see exactly where the
+    // corner starts and where it stops. The outline is smooth there, in the
+    // sense that its tangent is continuous, but its curvature is not: it jumps
+    // from zero to 1/R and back. Shading is a function of the normal, so it
+    // inherits that jump.
+    //
+    // Convolving the normal's angle with a gaussian along the ring gives the
+    // light a corner of its own, far wider than the geometric one and with no
+    // ends to notice. The vertices themselves are untouched, so the band still
+    // follows the tight radius -- only what falls on it is softened.
+    var ang = [], prev = 0;
+    for (var i = 0; i < m; i++) {
+      var a = Math.atan2(sh[i][1], sh[i][0]);
+      while (a - prev >  Math.PI) a -= 2 * Math.PI;    // unwrap: one lap, so
+      while (a - prev < -Math.PI) a += 2 * Math.PI;    // the angle climbs 2*pi
+      ang.push(a);
+      prev = a;
+    }
+    // The ribs are evenly spaced, so walking out from each one and stopping at
+    // three sigma covers the kernel in a couple of dozen steps rather than
+    // sweeping the whole ring for every rib.
+    var soft = [];
+    // A square bezel is flat faces meeting at seams: constant along a side, so
+    // there is nothing to blur there, and blurring across a corner is exactly
+    // what would soften the seam away.
+    if (BEZ.RADIUS === 0) {
+      soft = ang.slice();
+    } else
+    for (var i = 0; i < m; i++) {
+      var sw = 1, sa = ang[i];
+      for (var dir = -1; dir <= 1; dir += 2) {
+        for (var k = 1; k < m / 2; k++) {
+          var j = ((i + dir * k) % m + m) % m;
+          var t = Math.abs(arc[j] - arc[i]);
+          t = Math.min(t, total - t);                  // the ring is closed
+          if (t > 3 * SHADE_BLUR) break;
+          // ang climbs by 2*pi over the lap, so a neighbour reached the short
+          // way round the join is one lap out and has to be brought back.
+          var aj = ang[j] + Math.round((ang[i] - ang[j]) / (2 * Math.PI)) * 2 * Math.PI;
+          var wgt = Math.exp(-0.5 * (t / SHADE_BLUR) * (t / SHADE_BLUR));
+          sw += wgt;
+          sa += wgt * aj;
+        }
+      }
+      soft.push(sa / sw);
+    }
+
+    var data = new Float32Array(ribs.length * 12);
+    var o = 0;
+    for (var i = 0; i < ribs.length; i++) {
+      var q = qs[i], n = ns[i];
+      var a = soft[i % m];
+      var sn = [Math.cos(a), Math.sin(a)];
+      // Which face of the moulding this is, as a smooth function of the normal
+      // rather than a choice between four: down-facing is in shadow,
+      // up-facing catches the light.
+      var tone = 1.075 + 0.625 * sn[1] - 0.15 * sn[0];
+      // sqrt(2) at a mitre, so its outer vertex reaches the outer corner of
+      // the moulding rather than stopping one chamfer along the diagonal.
+      var sc = (ribs[i].length > 6) ? ribs[i][6] : 1.0;
+      for (var k = 0; k < 2; k++) {
+        // Distance out from the edge of the picture, in chamfers. The band's
+        // shape comes from the true normal.
+        var d = (k === 0) ? INNER : 1.0;
+        var px = q[0] + n[0] * d * band * sc;
+        var py = q[1] + n[1] * d * band * sc;
+        // How deep into the picture this vertex reflects, and along which way.
+        // The moulding is a mirror at a grazing angle, so a point one chamfer
+        // further out sees GAIN chamfers further in; START skips the Minitel's
+        // own black margin, which would otherwise reflect as a dead band right
+        // against the glass. The relation is linear in d, so the rasteriser
+        // interpolating between these two is exact, not an approximation.
+        var r = BEZ.START + d * band * BEZ.GAIN;
+        data[o++] = 2.0 * (px * ts + BEZ.BORDER) - 1.0;
+        data[o++] = 1.0 - 2.0 * (py * ts + BEZ.BORDER);
+        data[o++] = q[0] - sn[0] * r;
+        data[o++] = q[1] - sn[1] * r;
+        data[o++] = d;
+        data[o++] = tone;
+      }
+    }
+    return data;
+  }
+
+  function createGLRenderer() {
+    var opts = { alpha: false, antialias: false, depth: false, stencil: false,
+                 preserveDrawingBuffer: false, powerPreference: "low-power" };
+    var gl = canvas.getContext("webgl", opts) || canvas.getContext("experimental-webgl", opts);
+    if (!gl) return null;
+
+    // fwidth() gives an exact per-pixel footprint that follows the curvature's
+    // local stretch. It is an extension in WebGL 1 -- near-universal, but fall
+    // back to a uniform footprint rather than failing to compile.
+    var deriv = !!gl.getExtension("OES_standard_derivatives");
+    var prelude = deriv
+      ? "#extension GL_OES_standard_derivatives : enable\n#define HAVE_DERIV 1\n"
+      : "";
+
+    var progPersist, progBlur, progComposite, progRing, quad, ring, ringCount;
+    var texSrc, pingTex = [], pingFbo = [], blurTex = [], blurFbo = [];
+    var ambTex = [], ambFbo = [];
+    var srcW = 0, srcH = 0, cur = 0, seeded = false, lost = false;
+    var ditherPhase = 0;
+
+    function shader(type, src) {
+      var sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS))
+        throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+      return sh;
+    }
+
+    function program(fs, pre, vs, attrs) {
+      var p = gl.createProgram();
+      gl.attachShader(p, shader(gl.VERTEX_SHADER, vs || VERT));
+      gl.attachShader(p, shader(gl.FRAGMENT_SHADER, (pre || "") + fs));
+      (attrs || ["aPos"]).forEach(function (a, i) { gl.bindAttribLocation(p, i, a); });
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+        throw new Error(gl.getProgramInfoLog(p));
+      var u = {};
+      var n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+      for (var i = 0; i < n; i++) {
+        var name = gl.getActiveUniform(p, i).name;
+        u[name] = gl.getUniformLocation(p, name);
+      }
+      return { p: p, u: u };
+    }
+
+    function texture(w, h, linear) {
+      var t = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      var f = linear ? gl.LINEAR : gl.NEAREST;
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, f);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      return t;
+    }
+
+    function target(tex) {
+      var f = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return f;
+    }
+
+    function build() {
+      progPersist = program(FRAG_PERSIST);
+      progBlur = program(FRAG_BLUR);
+      progComposite = program(FRAG_COMPOSITE, prelude);
+      progRing = program(FRAG_RING, "", RING_VERT, ["aPos", "aRefl", "aInfo"]);
+      quad = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+      var verts = buildRing();
+      ringCount = verts.length / 6;
+      ring = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, ring);
+      gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+      useQuad();
+      srcW = srcH = 0;
+    }
+
+    function sized(w, h) {
+      if (w === srcW && h === srcH) return;
+      srcW = w; srcH = h; seeded = false;
+      texSrc = texture(w, h, false);
+      pingTex = [texture(w, h, true), texture(w, h, true)];
+      pingFbo = [target(pingTex[0]), target(pingTex[1])];
+      blurTex = [texture(w, h, true), texture(w, h, true)];
+      blurFbo = [target(blurTex[0]), target(blurTex[1])];
+      ambTex = [texture(w, h, true), texture(w, h, true)];
+      ambFbo = [target(ambTex[0]), target(ambTex[1])];
+    }
+
+    function pass(prog, fbo, w, h) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.viewport(0, 0, w, h);
+      gl.useProgram(prog.p);
+      return prog.u;
+    }
+
+    // The two draws want different vertex layouts, and with no vertex array
+    // objects in WebGL 1 that state is global, so each has to put it back.
+    function useQuad() {
+      gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    }
+
+    function useRing() {
+      gl.bindBuffer(gl.ARRAY_BUFFER, ring);
+      for (var i = 0; i < 3; i++) {
+        gl.enableVertexAttribArray(i);
+        gl.vertexAttribPointer(i, 2, gl.FLOAT, false, 24, i * 8);
+      }
+    }
+
+    function bind(unit, tex, loc) {
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.uniform1i(loc, unit);
+    }
+
+    canvas.addEventListener("webglcontextlost", function (e) { e.preventDefault(); lost = true; }, false);
+    canvas.addEventListener("webglcontextrestored", function () { build(); lost = false; }, false);
+
+    build();
+
+    return {
+      kind: "webgl",
+      draw: function (pixels, w, h, dtMs, crt, color, bezel) {
+        if (lost) return;
+        sized(w, h);
+
+        gl.bindTexture(gl.TEXTURE_2D, texSrc);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+
+        var screenTex = texSrc, bloomTex = texSrc, ambientTex = texSrc;
+
+        if (crt) {
+          // On the first CRT frame there is no history; seed both halves of the
+          // ping-pong so the effect does not fade up from black.
+          var decay = seeded ? Math.exp(-Math.max(dtMs, 1) / PHOSPHOR_TAU_MS) : 0;
+          cur ^= 1;
+          var u = pass(progPersist, pingFbo[cur], w, h);
+          bind(0, texSrc, u.uSrc);
+          bind(1, pingTex[cur ^ 1], u.uPrev);
+          gl.uniform1f(u.uDecay, decay);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+          if (!seeded) {
+            cur ^= 1;
+            u = pass(progPersist, pingFbo[cur], w, h);
+            bind(0, texSrc, u.uSrc);
+            bind(1, pingTex[cur ^ 1], u.uPrev);
+            gl.uniform1f(u.uDecay, 0);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            seeded = true;
+          }
+          screenTex = pingTex[cur];
+
+          u = pass(progBlur, blurFbo[0], w, h);
+          bind(0, screenTex, u.uTex);
+          gl.uniform2f(u.uStep, 1 / w, 0);
+          gl.uniform1f(u.uEncode, 0);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+          u = pass(progBlur, blurFbo[1], w, h);
+          bind(0, blurTex[0], u.uTex);
+          gl.uniform2f(u.uStep, 0, 1 / h);
+          gl.uniform1f(u.uEncode, 0);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+          bloomTex = blurTex[1];
+
+          // The broad, low-frequency light the bezel reflects. Done here, at
+          // source resolution, which is both cheaper and far smoother than
+          // averaging a grid of taps per output pixel -- a box of taps leaves
+          // the moulding covered in rectangular blotches.
+          //
+          // Widened by re-running the same kernel with the step doubling,
+          // rather than by running it once with a big step. The kernel is a
+          // nine-tap gaussian collapsed onto five taps, and it is only a
+          // gaussian at the spacing it was designed for: stretch the step to
+          // seven texels and the outer taps land 10 and 23 texels out with
+          // nothing sampled in between, which is a comb, not a blur. Fed sharp
+          // pixel art it returns evenly spaced ghosts of every bright feature,
+          // and the mirror then lays them along the bezel as a stack of
+          // stripes. Doubling keeps every step inside the support of the blur
+          // before it, so there is nothing left at that spacing to alias.
+          var src = blurTex[1];
+          for (var bi = 0; bi < AMB_STEPS.length; bi++) {
+            u = pass(progBlur, ambFbo[0], w, h);
+            bind(0, src, u.uTex);
+            gl.uniform2f(u.uStep, AMB_STEPS[bi] / w, 0);
+            gl.uniform1f(u.uEncode, 0);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+            u = pass(progBlur, ambFbo[1], w, h);
+            bind(0, ambTex[0], u.uTex);
+            gl.uniform2f(u.uStep, 0, AMB_STEPS[bi] / h);
+            // Only the very last one, whose output is what the bezel samples.
+            gl.uniform1f(u.uEncode, bi === AMB_STEPS.length - 1 ? 1 : 0);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            src = ambTex[1];
+          }
+          ambientTex = ambTex[1];
+        } else {
+          seeded = false;
+        }
+
+        var cw = canvas.width, chh = canvas.height;
+        var uc = pass(progComposite, null, cw, chh);
+        bind(0, screenTex, uc.uTex);
+        bind(1, bloomTex, uc.uBloom);
+        gl.uniform2f(uc.uSrcSize, w, h);
+        gl.uniform2f(uc.uPx, 1 / cw, 1 / chh);
+        gl.uniform2f(uc.uFootprint, w / cw, h / chh);
+        gl.uniform1f(uc.uScale, chh / h);
+        gl.uniform1f(uc.uCrt, crt ? 1 : 0);
+        // With no moulding there is nothing to keep the margin for, so the
+        // tube expands into it. The bow still pulls the corners in short of
+        // the canvas while the edge midpoints reach it, which is what the
+        // margin was leaving room for in the first place.
+        gl.uniform1f(uc.uBorder, bezel ? BEZ.BORDER : 0.0);
+        gl.uniform1f(uc.uTime, ditherPhase);
+        gl.uniform1f(uc.uColor, color ? 1 : 0);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+        // The moulding: the lit chamfer around the glass, drawn over the black
+        // margin the composite left. Additive, because this pass is the light
+        // falling on the plastic rather than the plastic itself -- which is
+        // why switching it off leaves the margin black rather than grey.
+        if (crt && bezel) {
+          var ur = pass(progRing, null, cw, chh);
+          bind(1, bloomTex, ur.uBloom);
+          bind(2, ambientTex, ur.uAmb);
+          gl.uniform3f(ur.uHalo, color ? 1 : 0.80, color ? 1 : 0.95, 1);
+          gl.uniform1f(ur.uTime, ditherPhase);
+          gl.enable(gl.BLEND);
+          gl.blendFunc(gl.ONE, gl.ONE);
+          useRing();
+          gl.drawArrays(gl.TRIANGLE_STRIP, 0, ringCount);
+          gl.disable(gl.BLEND);
+          gl.disableVertexAttribArray(1);
+          gl.disableVertexAttribArray(2);
+          useQuad();
+        }
+
+        ditherPhase = (ditherPhase + 1) % 1024;
+      }
+    };
+  }
+
+  function create2DRenderer() {
+    var ctx = canvas.getContext("2d", { alpha: false });
+    var image = null;
+    return {
+      kind: "2d",
+      draw: function (pixels, w, h) {
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+          image = null;
+        }
+        if (!image) image = ctx.createImageData(w, h);
+        image.data.set(pixels);
+        ctx.putImageData(image, 0, 0);
+      }
+    };
+  }
+
+  var renderer = null;
+  try {
+    renderer = createGLRenderer();
+  } catch (e) {
+    // Falling back is the right behaviour, but doing it silently makes a
+    // driver quirk or a shader that will not compile on some device look like
+    // the CRT toggle is simply broken.
+    if (window.console) window.console.warn("Minitel: WebGL unavailable, using 2D —", e && e.message);
+    renderer = null;
+  }
+  if (!renderer) renderer = create2DRenderer();
+
+  // What the visitor last chose, falling back to the configured default. An
+  // absent value and an unreadable store are the same thing here: no choice
+  // has been made, so the default stands.
+  function storedFlag(key, dflt) {
+    try {
+      var v = localStorage.getItem(key);
+      if (v !== null) return v === "1";
+    } catch (e) { /* storage unavailable */ }
+    return dflt;
+  }
+
+  // CRT is only meaningful on the WebGL path, and the moulding is drawn over
+  // that pipeline's margin, so it needs the pipeline too.
+  var crtOn = renderer.kind === "webgl"
+              && storedFlag("minitel2.crt", DEFAULT_MODE.crt);
+  var bezelOn = crtOn && storedFlag("minitel2.bezel", DEFAULT_MODE.bezel);
+
+  // The eight Videotex colors, or the greys the Minitel 2's monochrome tube
+  // shows them as. Off by default: the machine being emulated is monochrome.
+  var colorOn = storedFlag("minitel2.color", DEFAULT_MODE.color);
+
+  // With the CRT pipeline the drawing buffer has to be at display resolution,
+  // or the curvature and scanlines get computed on a 334-pixel-wide image and
+  // then stretched. The 2D path keeps its source-sized buffer and lets CSS
+  // scale it, which is what image-rendering: pixelated is there for.
+  function resizeBuffer() {
+    if (renderer.kind !== "webgl") return;
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var w = Math.min(1920, Math.max(1, Math.round(canvas.clientWidth * dpr)));
+    var h = Math.min(1440, Math.max(1, Math.round(canvas.clientHeight * dpr)));
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  }
+
+  if (window.ResizeObserver) new ResizeObserver(resizeBuffer).observe(canvas);
+  else window.addEventListener("resize", resizeBuffer);
+  resizeBuffer();
+
+  function draw(dtMs) {
+    var w = api.width(), h = api.height();
+    var px = api.rgba();
+    var len = w * h * 4;
+    // Cache the heap view: rebuilding it every frame is 60 throwaway objects a
+    // second for no reason. Memory growth is off, so it stays valid.
+    if (!view || viewAt !== px || viewLen !== len) {
+      view = heap.subarray(px, px + len);
+      viewAt = px;
+      viewLen = len;
+    }
+    renderer.draw(view, w, h, dtMs, crtOn, colorOn, bezelOn);
+  }
+
+  var lastDraw = 0;
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+
+    var want = pacer.tick(now);
+    var t = fps ? performance.now() : 0;
+
+    for (var i = 0; i < want; i++) {
+      api.runFrame();
+      frameNo++;
+      while (pendingUp.length && pendingUp[0].at <= frameNo)
+        pendingUp.shift().keys.forEach(keyUp);
+    }
+
+    audio.pump();
+
+    if (want) {
+      // Phosphor decay runs on real elapsed time, so a dropped frame dims by
+      // the right amount instead of by one frame's worth.
+      var dt = lastDraw ? now - lastDraw : 16.7;
+      lastDraw = now;
+      draw(dt > 250 ? 250 : dt);
+    }
+
+    if (fps) { if (want) fps.busy += performance.now() - t; fps.tick(now, want); }
+  }
+
+  // ---------------------------------------------------------------------
+  // Display mode
+  // ---------------------------------------------------------------------
+  function setCrt(on) {
+    crtOn = renderer.kind === "webgl" && on;
+    try { localStorage.setItem("minitel2.crt", crtOn ? "1" : "0"); } catch (e) { }
+  }
+
+  function setColor(on) {
+    colorOn = !!on;
+    api.setColor(colorOn ? 1 : 0);
+    try { localStorage.setItem("minitel2.color", colorOn ? "1" : "0"); } catch (e) { }
+  }
+
+  function setBezel(on) {
+    bezelOn = !!(crtOn && on);
+    try { localStorage.setItem("minitel2.bezel", bezelOn ? "1" : "0"); } catch (e) { }
+  }
+
+  // The three settings stay independent -- stored separately, and the machine
+  // only knows about colour -- but one key walks MODE_LIST in order, so there
+  // is a single shortcut to document and a single one to press.
+  //
+  // On the 2D fallback, which has neither tube nor moulding, the CRT entries
+  // drop out rather than sitting in the cycle as duplicates of the flat ones
+  // and making the key look broken.
+  var MODES = MODE_LIST.filter(function (m) {
+    return renderer.kind === "webgl" || !m.crt;
+  });
+
+  function cycleDisplay() {
+    var i = 0;
+    for (var n = 0; n < MODES.length; n++) {
+      // Compared as booleans: a stray 0 or 1 in any of the three would match
+      // nothing and silently restart the cycle from the top instead of
+      // resuming where it left off.
+      if (MODES[n].crt === !!crtOn && MODES[n].bezel === !!bezelOn
+          && MODES[n].color === !!colorOn) { i = n; break; }
+    }
+    var next = MODES[(i + 1) % MODES.length];
+    setCrt(next.crt);
+    setBezel(next.bezel);
+    setColor(next.color);
+  }
+
+  // ---------------------------------------------------------------------
+  // Input
+  // ---------------------------------------------------------------------
+  // Every key is reference counted, so a tap cannot release a key the keyboard
+  // is still holding, and a second finger landing and lifting cannot release
+  // one the first is still on.
+  var held = {};
+  var pendingUp = [];     // releases waiting out the minimum press
+  var frameNo = 0;
+
+  function keyDown(entry) {
+    if (!entry || !api) return;
+    var k = entry[0] + "," + entry[1];
+    held[k] = (held[k] || 0) + 1;
+    if (held[k] === 1) api.setKey(entry[0], entry[1], 1);
+  }
+
+  function keyUp(entry) {
+    if (!entry || !api) return;
+    var k = entry[0] + "," + entry[1];
+    if (!held[k]) return;
+    if (--held[k] === 0) api.setKey(entry[0], entry[1], 0);
+  }
+
+  function releaseEverything() {
+    held = {};
+    pendingUp.length = 0;
+    tapPointers = 0;
+    if (api) api.releaseAll();
+  }
+
+  window.addEventListener("keydown", function (e) {
+    if (!api || e.metaKey) return;
+
+    // An open ROM menu is being driven with the arrow keys, which are also the
+    // machine's; while it has focus they are its.
+    if (menu && document.activeElement === menu) return;
+
+    // Display shortcut, from config.js. Checked before the Minitel matrix, so
+    // a shortcut that is also a Minitel key takes precedence over it.
+    if (DISPLAY_KEY && e.code === DISPLAY_KEY) {
+      e.preventDefault();
+      if (!e.repeat) cycleDisplay();
+      return;
+    }
+
+    var entry = KEYMAP[e.code] || FKEYS[e.code];
+    if (!entry) return;
+    e.preventDefault();
+    if (!e.repeat) keyDown(entry);
+  });
+
+  window.addEventListener("keyup", function (e) {
+    if (!api) return;
+    if (menu && document.activeElement === menu) return;
+    var entry = KEYMAP[e.code] || FKEYS[e.code];
+    if (!entry) return;
+    e.preventDefault();
+    keyUp(entry);
+  });
+
+  // A key held when the page loses focus would stay stuck down.
+  window.addEventListener("blur", releaseEverything);
+
+  // ---------------------------------------------------------------------
+  // Touch
+  //
+  // With no on-screen controls, a tap is the only input a phone has. It sends
+  // Space and Up together, which between them cover the ROMs built around a
+  // single control. Press and release follow the pointer, so a tap is a tap
+  // and a hold is a hold.
+  // ---------------------------------------------------------------------
+  // Default: Space (Y0.6) and Up (Y14.6).
+  var TAP_KEYS = (Array.isArray(CFG.tapKeys) ? CFG.tapKeys : ["Space", "ArrowUp"])
+    .map(resolveKey).filter(Boolean);
+
+  // The firmware scans the matrix a little under once per frame, so a quick
+  // tap can fall between two scans and be missed. Hold it for a few frames
+  // however briefly the finger was down.
+  var TAP_MIN_FRAMES = 4;
+
+  var tapPointers = 0, tapFrame = 0;
+
+  function tapDown(e) {
+    // A tap on the ROM menu is opening the menu, and preventDefault() on it
+    // would stop that.
+    if (menu && menu.contains(e.target)) return;
+
+    // Inside an iframe the page receives no key events until it has focus, and
+    // a visitor's first interaction with an embedded game is a click on it.
+    // That click is only ever meant to focus the frame, so the mouse does not
+    // reach the machine at all -- otherwise it would skip the title screen the
+    // player has not read yet. Touch has no other way in, so it still acts.
+    window.focus();
+    if (e.pointerType !== "touch" && e.pointerType !== "pen") return;
+    if (!api || !TAP_KEYS.length || drop.classList.contains("on")) return;
+    e.preventDefault();
+    if (tapPointers++ === 0) {
+      tapFrame = frameNo;
+      TAP_KEYS.forEach(keyDown);
+    }
+  }
+
+  function tapUp() {
+    if (!api || tapPointers === 0) return;
+    if (--tapPointers > 0) return;
+    var wait = TAP_MIN_FRAMES - (frameNo - tapFrame);
+    if (wait > 0) pendingUp.push({ at: frameNo + wait, keys: TAP_KEYS });
+    else TAP_KEYS.forEach(keyUp);
+  }
+
+  window.addEventListener("pointerdown", tapDown);
+  window.addEventListener("pointerup", tapUp);
+  window.addEventListener("pointercancel", tapUp);
+  window.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+
+  // Capture, so this sees the gesture whatever else does with it.
+  ["pointerdown", "keydown", "touchend"].forEach(function (t) {
+    window.addEventListener(t, function () { audio.unlock(); }, true);
+  });
+
+  window.focus();
+
+  // ---------------------------------------------------------------------
+  // Boot
+  // ---------------------------------------------------------------------
+  createMinitel().then(function (mod) {
+    Module = mod;
+    heap = mod.HEAPU8;        // memory growth is off, so these views are stable
+    heapf = mod.HEAPF32;
+    api = bind(mod);
+    mod._mt_init();
+
+    // The core is the authority on the rate: it silently keeps its own if the
+    // requested one is out of range, and pacing off the requested value would
+    // then run the machine at the wrong speed rather than merely refusing.
+    api.setRefreshHz(MACHINE_HZ);
+    MACHINE_HZ = api.refreshHz();
+    if (MACHINE_HZ !== REFRESH_HZ)
+      warn("the core kept " + MACHINE_HZ + " Hz rather than the requested " + REFRESH_HZ);
+    pacer = createPacer(MACHINE_HZ);
+
+    // Before the first frame runs, so the machine generates at the output rate
+    // from the start. This also picks up a visitor who interacted with the
+    // page while it was still loading, which is early enough that the gesture
+    // listeners were not yet the ones that saw it.
+    audio.unlock();
+
+    setCrt(crtOn);
+    setBezel(bezelOn);
+    setColor(colorOn);
+
+    // A game published on its own ships its image next to the page and
+    // config.js may name several; anything else falls back to letting the
+    // visitor pick one.
+    selectRom(romIndex)
+      .catch(function () {
+        // A remembered choice that has since left the folder. The first entry
+        // is the one config.js leads with, so try that before giving up.
+        return romIndex === 0 ? Promise.reject() : selectRom(0);
+      })
+      .catch(askForRom);
+  });
+})();
+</script>
+</body>
+</html>
