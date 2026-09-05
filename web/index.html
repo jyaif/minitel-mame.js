@@ -51,6 +51,30 @@
     cursor: pointer;
   }
   #drop input { display: none; }
+
+  /* The ROM menu, present only when config.js lists more than one image.
+     Dimmed until it is wanted, so a page showing a single game the whole time
+     is not asking to be clicked. It sits over the picture rather than beside
+     it: the frame is letterboxed to 4:3 and there is no room outside. */
+  #roms {
+    position: fixed;
+    top: 10px;
+    right: 12px;
+    z-index: 1;
+    display: none;
+    max-width: 45vw;
+    padding: 5px 8px;
+    border: 1px solid #4a3c2c;
+    border-radius: 8px;
+    background: #000a;
+    color: #d8cbb4;
+    font: 12px/1.2 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    opacity: .45;
+    transition: opacity .15s;
+    cursor: pointer;
+  }
+  #roms.on { display: block; }
+  #roms:hover, #roms:focus { opacity: 1; }
 </style>
 </head>
 <body>
@@ -64,6 +88,9 @@
     <input type="file" id="file" accept=".bin,.rom,application/octet-stream">
   </label>
 </div>
+
+<!-- After #drop, so it stays reachable while the drop panel is up. -->
+<select id="roms" aria-label="ROM"></select>
 
 <script src="config.js"></script>
 <script src="minitel.js"></script>
@@ -227,7 +254,54 @@
            + MODE_LIST.map(function (m) { return m.name; }).join(", "));
   }
 
+  // ---------------------------------------------------------------------
+  // The ROMs on offer, from config.js. An entry is either a file name or a
+  // { name, file } pair; without a name the file's own, stripped of its
+  // extension, labels it in the menu. With nothing configured the page looks
+  // for rom.bin next to itself, which is how a single game ships.
+  // ---------------------------------------------------------------------
+  var ROMS = [];
+  if (CFG.roms !== undefined) {
+    (Array.isArray(CFG.roms) ? CFG.roms : [CFG.roms]).forEach(function (entry) {
+      var file = typeof entry === "string" ? entry
+                 : (entry && typeof entry === "object" ? entry.file : null);
+      if (!file) {
+        warn("config.js has a roms entry that names no file: "
+             + JSON.stringify(entry));
+        return;
+      }
+      file = String(file);
+      var name = (entry && entry.name !== undefined) ? String(entry.name)
+                 : file.replace(/^.*\//, "").replace(/\.[^.]*$/, "");
+      ROMS.push({ name: name, file: file, bytes: null });
+    });
+    if (!ROMS.length)
+      warn("config.js roms lists nothing loadable — looking for rom.bin");
+  }
+  if (!ROMS.length) ROMS = [{ name: "rom", file: "rom.bin", bytes: null }];
+
+  // The 24C02 is the machine's own EEPROM, but a native ROM is free to keep
+  // whatever it likes in there, so two games sharing one 256-byte image would
+  // overwrite each other. Each ROM gets its own, keyed by file name -- except
+  // rom.bin, which keeps the plain key a single published game has been
+  // saving under all along.
   var NVRAM_KEY = "minitel2.nvram";
+
+  function nvramKey(file) {
+    return file === "rom.bin" ? "minitel2.nvram" : "minitel2.nvram:" + file;
+  }
+
+  // Which of the ROMs the visitor last ran. Only the starting point, and only
+  // consulted when there is a menu to have chosen from.
+  var ROM_KEY = "minitel2.rom";
+  var romIndex = 0;
+  if (ROMS.length > 1) {
+    try {
+      var lastRom = localStorage.getItem(ROM_KEY);
+      for (var qi = 0; qi < ROMS.length; qi++)
+        if (ROMS[qi].file === lastRom) romIndex = qi;
+    } catch (e) { /* storage unavailable: start where config.js says */ }
+  }
 
   // Opening the page with ?fps shows what the pacing settled on: the machine's
   // speed against the wall clock, emulated frames per second, the display rate
@@ -295,21 +369,117 @@
   // ---------------------------------------------------------------------
   // ROM loading
   // ---------------------------------------------------------------------
-  function loadRom(bytes) {
+  function loadRom(bytes, file) {
+    // The EEPROM of whatever was running, before the image that owns it is
+    // replaced. Nothing has run yet on the first load, so there is nothing to
+    // write and the blank 256 bytes must not be saved over a real one.
+    if (running) saveNvram();
+
     var max = api.romBufferSize();
     if (bytes.length > max) bytes = bytes.subarray(0, max);
     heap.set(bytes, api.romBuffer());
-    api.loadRom(bytes.length);
+    NVRAM_KEY = nvramKey(file);
+    api.loadRom(bytes.length);   // resets the machine, EEPROM included
     restoreNvram();
+
+    // A key held across the swap would be held down on a machine that has just
+    // come up, and the new ROM would never see it released.
+    releaseEverything();
+
     drop.classList.remove("on");
     if (!running) { running = true; requestAnimationFrame(frame); }
   }
 
   function askForRom() { drop.classList.add("on"); }
 
+  // A dropped file is bytes the page already holds; anything from config.js is
+  // fetched, and a host that answers a missing file with an HTML page counts as
+  // missing.
+  function fetchRom(rom) {
+    if (rom.bytes) {
+      loadRom(rom.bytes, rom.file);
+      return Promise.resolve();
+    }
+    return fetch(rom.file, { cache: "no-cache" })
+      .then(function (r) { return r.ok ? r.arrayBuffer() : Promise.reject(); })
+      .then(function (b) {
+        var bytes = new Uint8Array(b);
+        if (!bytes.length || bytes[0] === 0x3c) return Promise.reject();
+        loadRom(bytes, rom.file);
+      });
+  }
+
+  // ---------------------------------------------------------------------
+  // The ROM menu, which exists only when there is a choice to make.
+  // ---------------------------------------------------------------------
+  var menu = null;
+
+  function addOption(rom) {
+    var o = document.createElement("option");
+    o.textContent = rom.name;
+    menu.appendChild(o);
+    return o;
+  }
+
+  if (ROMS.length > 1) {
+    menu = document.getElementById("roms");
+    ROMS.forEach(addOption);
+    menu.selectedIndex = romIndex;
+    menu.classList.add("on");
+    menu.addEventListener("change", function () {
+      // Nothing has been chosen until it loads, so this reports only what the
+      // console already carries.
+      selectRom(menu.selectedIndex).catch(function () { });
+      // The menu keeps focus after a click, and the arrow keys are the
+      // Minitel's before they are the menu's.
+      menu.blur();
+      window.focus();
+    });
+  }
+
+  function setRomIndex(i) {
+    romIndex = i;
+    if (menu) menu.selectedIndex = i;
+  }
+
+  // Loading is what makes a choice real: a ROM that is not there leaves the
+  // machine running what it was, and the menu pointing at it.
+  function selectRom(i) {
+    var was = romIndex;
+    return fetchRom(ROMS[i]).then(function () {
+      setRomIndex(i);
+      // A dropped file is not in config.js and will not be there next visit.
+      if (!ROMS[i].bytes)
+        try { localStorage.setItem(ROM_KEY, ROMS[i].file); } catch (e) { }
+    }, function (e) {
+      warn('cannot load "' + ROMS[i].file + '"');
+      setRomIndex(was);
+      return Promise.reject(e);
+    });
+  }
+
+  // A dropped file is not one of the configured ROMs, but the menu is where a
+  // visitor looks to see what is running, so it takes a slot at the end of the
+  // list -- the same slot each time, for as long as the page is open.
+  var dropped = null;
+
+  function useDroppedRom(f) {
+    f.arrayBuffer().then(function (b) {
+      if (!dropped) {
+        dropped = { name: "", file: "", bytes: null };
+        ROMS.push(dropped);
+        if (menu) addOption(dropped);
+      }
+      dropped.name = dropped.file = f.name;
+      dropped.bytes = new Uint8Array(b);
+      if (menu) menu.options[ROMS.length - 1].textContent = dropped.name;
+      selectRom(ROMS.length - 1).catch(function () { });
+    });
+  }
+
   document.getElementById("file").addEventListener("change", function (e) {
     var f = e.target.files[0];
-    if (f) f.arrayBuffer().then(function (b) { loadRom(new Uint8Array(b)); });
+    if (f) useDroppedRom(f);
   });
 
   ["dragenter", "dragover"].forEach(function (t) {
@@ -318,7 +488,7 @@
   window.addEventListener("drop", function (e) {
     e.preventDefault();
     var f = e.dataTransfer.files[0];
-    if (f) f.arrayBuffer().then(function (b) { loadRom(new Uint8Array(b)); });
+    if (f) useDroppedRom(f);
   });
 
   // ---------------------------------------------------------------------
@@ -1673,6 +1843,10 @@
   window.addEventListener("keydown", function (e) {
     if (!api || e.metaKey) return;
 
+    // An open ROM menu is being driven with the arrow keys, which are also the
+    // machine's; while it has focus they are its.
+    if (menu && document.activeElement === menu) return;
+
     // Display shortcut, from config.js. Checked before the Minitel matrix, so
     // a shortcut that is also a Minitel key takes precedence over it.
     if (DISPLAY_KEY && e.code === DISPLAY_KEY) {
@@ -1689,6 +1863,7 @@
 
   window.addEventListener("keyup", function (e) {
     if (!api) return;
+    if (menu && document.activeElement === menu) return;
     var entry = KEYMAP[e.code] || FKEYS[e.code];
     if (!entry) return;
     e.preventDefault();
@@ -1718,6 +1893,10 @@
   var tapPointers = 0, tapFrame = 0;
 
   function tapDown(e) {
+    // A tap on the ROM menu is opening the menu, and preventDefault() on it
+    // would stop that.
+    if (menu && menu.contains(e.target)) return;
+
     // Inside an iframe the page receives no key events until it has focus, and
     // a visitor's first interaction with an embedded game is a click on it.
     // That click is only ever meant to focus the frame, so the mouse does not
@@ -1782,15 +1961,14 @@
     setBezel(bezelOn);
     setColor(colorOn);
 
-    // A game published on its own ships its image next to the page; anything
-    // else falls back to letting the visitor pick one.
-    fetch("rom.bin", { cache: "no-cache" })
-      .then(function (r) { return r.ok ? r.arrayBuffer() : Promise.reject(); })
-      .then(function (b) {
-        var bytes = new Uint8Array(b);
-        // Guard against a host that answers a missing file with an HTML page.
-        if (!bytes.length || bytes[0] === 0x3c) return Promise.reject();
-        loadRom(bytes);
+    // A game published on its own ships its image next to the page and
+    // config.js may name several; anything else falls back to letting the
+    // visitor pick one.
+    selectRom(romIndex)
+      .catch(function () {
+        // A remembered choice that has since left the folder. The first entry
+        // is the one config.js leads with, so try that before giving up.
+        return romIndex === 0 ? Promise.reject() : selectRom(0);
       })
       .catch(askForRom);
   });

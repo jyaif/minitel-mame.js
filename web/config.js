@@ -1,5 +1,5 @@
-// Edit this file to change the display shortcut and what tapping the screen
-// does.
+// Edit this file to change which ROMs the page offers, the display shortcut
+// and what tapping the screen does.
 // Every field is optional. The whole file is optional too.
 //
 // Key names are either a KeyboardEvent.code ("Space", "ArrowUp", "KeyA",
@@ -11,6 +11,20 @@
 //
 
 window.MINITEL_CONFIG = {
+  // The ROMs on offer, as files sitting next to this one. An entry is either a
+  // file name or a { name, file } pair; without a name the file's own, without
+  // its extension, is what the menu shows.
+  //
+  // List more than one and a menu appears in the top right corner to switch
+  // between them. The first is what a visitor sees on arrival, until they pick
+  // another -- after that the page remembers their choice. Each ROM gets its
+  // own EEPROM, so two games cannot overwrite each other's saved state.
+  //
+  // Leave this out and the page loads rom.bin, which is how a single game is
+  // published. Whatever is listed, a ROM dropped onto the page still runs.
+  //
+  // roms: [{name:"Dino", file: "dino.bin"}, { name: "Hello Modem", file: "hello_modem.bin" }],
+
   // Steps through the six display modes, stripping the presentation away a
   // layer at a time: the whole machine (tube and bezel), then the tube alone,
   // then the raw image -- each in monochrome, then colour. null disables the

@@ -1,9 +1,7 @@
 # minitel-mame.js — a Minitel 2 emulator for the web
 
 A WebAssembly emulator for the **Philips Minitel 2 (NFZ 400)**, built so that
-native Minitel ROMs — the kind you write with
-[minitel-native](https://github.com/fabio-d/minitel-native) — can be played in a
-browser.
+native Minitel ROMs can be played in a browser.
 
 ## Quick start
 
@@ -17,15 +15,12 @@ make serve      # build and serve web/ on http://localhost:8000
 Drop a `.bin` onto the page, or put the ROM next to `index.html` as `rom.bin`
 and it loads automatically.
 
-### To publish a game:
+### To publish a rom:
 
 ```sh
-cp my-game.bin web/rom.bin
+cp my-rom.bin web/rom.bin
 make dist       # -> build/minitel-web.zip
 ```
-
-On itch.io, upload the zip, tick *This file will be played in the browser*, and
-set the viewport to any 4:3 size.
 
 ## What this is
 
@@ -59,27 +54,38 @@ src/wasm/
   api.cpp         the C entry points the page calls
 src/ts9347.bin    the character generator ROM, compiled into the module
 web/              the page: WebGL CRT renderer, sound, keyboard, ROM, EEPROM
-  config.js       display shortcut, video rate, volume, bezel colour, touch keys
+  config.js       the ROMs on offer, display shortcut, video rate, volume,
+                  bezel colour, touch keys
 tools/
   mkcharset.py    turn ts9347.bin into charset_rom.h, run by the Makefile
 ```
 
 ### Configuring it
 
-`web/config.js` holds the front-end settings — the display shortcut, the video
-rate, how loud the speaker is, the colour of the moulding, and what tapping the
-screen sends:
+`web/config.js` holds the front-end settings: which ROMs the page offers, the
+display shortcut, the video rate, how loud the speaker is, the colour of the
+moulding, and what tapping the screen sends:
 
 ```js
 window.MINITEL_CONFIG = {
-  displayKey: "Tab",                 // null to disable; default "Backslash"
-  displayMode: "bezel",              // which mode to start in
-  refreshHz:  50,                    // 60 is MAME's value; default 50
-  volume:     0.35,                  // 0 to 1; 0 switches sound off
-  bezelColor: "#121215",             // "#rgb" or "#rrggbb"
-  tapKeys:    ["Space", "ArrowUp"]   // [] for no touch input
+  roms: ["foo-rom.bin", "bar-rom.bin"], // omitted: just rom.bin
+  displayKey: "Tab",                    // null to disable; default "Backslash"
+  displayMode: "bezel",                 // which mode to start in
+  refreshHz:  50,                       // 60 is MAME's value; default 50
+  volume:     0.35,                     // 0 to 1; 0 switches sound off
+  bezelColor: "#121215",              // "#rgb" or "#rrggbb"
+  tapKeys:    ["Space", "ArrowUp"]      // [] for no touch input
 };
 ```
+
+`roms` lists the images sitting next to the page. An entry is either a file
+name or a `{ name, file }` pair, the name being what the menu shows; without one
+the file name, minus its extension, is used. One entry — or none, which means
+`rom.bin` — runs that ROM and shows nothing; more than one adds a menu in the
+top right corner, starting on the first entry and afterwards on whichever the
+visitor last chose. Each ROM keeps its own 24C02 EEPROM, so two roms do not
+overwrite each other's saved state, and a ROM dropped onto the page still runs
+whatever is listed.
 
 `displayKey` steps through six display modes, stripping the presentation away a
 layer at a time — `bezel`, `tube`, `flat`, each also with a `-color` variant.
@@ -90,18 +96,12 @@ page falls back to a 2D renderer with neither tube nor bezel, and the key
 alternates between the two colour modes.
 
 `refreshHz` is the one field that reaches into the emulation; the rest are the
-page's. `volume` is a plain gain on the machine's output, and that output is
-full-scale — the beep is a square wave that reaches both rails — so the default
-is well under 1. Browsers do not let a page make a sound before the visitor has
-interacted with it, so the first key or tap is what actually starts the audio;
-`volume: 0` opens no audio hardware at all.
+page's. `volume` is a plain gain on the machine's output.
 
-`bezelColor` tints the moulding around the tube — the lit chamfer next to the
-glass, which is the whole of it — and only the WebGL renderer draws one; the 2D
-fallback has none.
+`bezelColor` tints the moulding around the tube.
 
 Key names are either a `KeyboardEvent.code` or the label on the Minitel's own
-keys — `Suite`, `Retour`, `Envoi`, `Repetition`, `Tel`, `Guide`, `Sommaire`,
+keys :`Suite`, `Retour`, `Envoi`, `Repetition`, `Tel`, `Guide`, `Sommaire`,
 `Connexion`, `MarcheArret`, `Fonction`, `Annulation`, `Correction`. The file,
 and any field in it, may be missing; the defaults above then apply. An unknown
 name, or a shortcut that is also a Minitel key and would therefore swallow it,
@@ -109,14 +109,7 @@ is reported on the console.
 
 ## Licence
 
-The extracted code keeps its MAME licences: the MCS-51 core, the I²C memory and
-the driver are BSD-3-Clause; `ef9345.cpp` is **GPL-2.0-or-later**. A build that
-links them together is therefore GPL-2.0-or-later as a whole, which is worth
-knowing before publishing a game alongside it.
-
-Original copyright holders, per the file headers: Steve Ellenoff, Manuel Abadia
-and Couriersud (MCS-51); Daniel Coulom and Sandro Ronco (EF9345); smf (I²C
-memory); Jean-François Del Nero (the Minitel 2 driver and the TS9347 variant).
+The extracted code keeps its MAME licences.
 
 Every source file carries an SPDX `license:` tag in its header saying which of
 the two applies to it. `LICENSE` is the GPL-2.0 text that governs the combined
