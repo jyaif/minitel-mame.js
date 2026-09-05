@@ -18,13 +18,16 @@
 //  - Keyboard
 //  - 24C02 EEPROM
 //
+//  - Sound output: the TS7514 modem's monitor path, which is the only thing
+//    on this machine wired to a speaker.
+//
 // What MAME's driver has and this build drops:
 //
-//  - The modem and the rear serial port (prise peri-informatique). MAME
-//    configures both RS232 ports with no device plugged in, which leaves RXD
-//    idle high on each; that is reproduced here as a constant, so what the
-//    firmware reads on P1/P3 and on INT1 is unchanged.
-//  - Sound output, which MAME does not emulate either (MACHINE_NO_SOUND).
+//  - The modem and the rear serial port (prise peri-informatique) as serial
+//    links. MAME configures both RS232 ports with no device plugged in, which
+//    leaves RXD idle high on each; that is reproduced here as a constant, so
+//    what the firmware reads on P1/P3 and on INT1 is unchanged. The modem's
+//    audio side is emulated -- see the sound section below.
 
 #ifndef MINITEL_MINITEL_H
 #define MINITEL_MINITEL_H
@@ -97,6 +100,37 @@ public:
 	void release_all_keys();
 	static bool row_populated(int row);
 
+	// SOUND
+	//
+	// The Minitel's speaker is the modem's monitor output: the TS7514 line
+	// interface can route what it is transmitting or receiving to it, and the
+	// firmware uses that to make the machine audible -- dialling tones, the
+	// call progress it plays back while connecting, and, for a program that
+	// drives the chip itself, DTMF tones as a crude four-by-four tone
+	// generator. MAME models the two sources the monitor can carry: the DTMF
+	// pair selected by RDTMF, and the fixed "signalling frequency" beep.
+	//
+	// Samples accumulate as the machine runs, at whatever rate was set, and
+	// the host drains them after each frame. They accumulate continuously,
+	// silence included, so a quiet machine yields a frame's worth of zeroes
+	// rather than nothing -- which is what lets a host keep one unbroken
+	// output timeline instead of splicing tones into it.
+
+	static constexpr int DEFAULT_AUDIO_RATE = 48000;
+
+	// MAME fixes the modem stream at 48 kHz. Making it settable lets a host
+	// generate directly at its output rate and resample nothing; both tone
+	// generators derive their phase step from it, so any rate works.
+	// Out-of-range values are ignored, so audio_rate() is the rate in effect.
+	void set_audio_rate(int hz);
+	int audio_rate() const { return m_audio_rate; }
+
+	// Move up to max samples out of the buffer, oldest first, and return how
+	// many were moved. Samples are mono and nominally in [-1, +1], the range
+	// MAME's stream works in.
+	std::size_t audio_read(float *dst, std::size_t max);
+	std::size_t audio_available() const { return std::size_t(m_audio_written - m_audio_taken); }
+
 	// 24C02 contents, for the host to persist between sessions
 	u8 *nvram() { return m_i2cmem.data(); }
 	static constexpr std::size_t NVRAM_SIZE = i2c_24c02_device::DATA_SIZE;
@@ -145,6 +179,14 @@ private:
 	u8 port3_r();
 
 	void update_modem_state();
+	void modem_exec_command();
+
+	// Bring the audio buffer up to m_time_ns using the state in effect over
+	// the span, then let the caller change that state -- the same discipline
+	// as MAME's stream->update() calls, and for the same reason.
+	void sound_update();
+	void sound_generate(std::size_t samples);
+	void sound_push(float sample);
 
 	void dev_ctrl_reg_w(offs_t offset, u8 data);
 	u8 dev_keyb_ser_r(offs_t offset);
@@ -169,6 +211,18 @@ private:
 	u8 last_ctrl_reg = 0;
 
 	int lineconnected = 0;
+
+	// TS7514 registers, as far as the monitor output needs them. The chip
+	// takes commands over a shift register: with DTMF and MCBC both low it is
+	// in control mode, PRD carries data and each falling edge of RTS clocks
+	// one bit in; leaving control mode executes what was shifted in. RWLO
+	// selects what the monitor listens to, RDTMF which of the sixteen DTMF
+	// pairs to send, RPTF which halves of the pair the output filter passes.
+	// RWLO powers up at 0xF, which is "monitor nothing".
+	u8 modem_input_reg = 0;
+	u8 modem_rdtmf_reg = 0;
+	u8 modem_rwlo_reg = 0xF;
+	u8 modem_rptf_reg = 0;
 
 	bool m_color = false;
 
@@ -195,6 +249,31 @@ private:
 
 	// execute_run may overshoot the cycles it was asked for; carry the excess.
 	int m_cycle_debt = 0;
+
+	// AUDIO
+	//
+	// Generation is driven off m_time_ns, which advances a scanline at a time,
+	// so a change to the modem state takes effect at the scanline boundary it
+	// falls in rather than at the exact sample. That is 64 us at 50 Hz against
+	// tones that last tens of milliseconds, and it is why sound_update() can
+	// be a cheap call at every state change.
+	//
+	// The buffer holds a third of a second, which no host should ever need:
+	// it is drained once per emulated frame, and overrunning it means the
+	// machine ran without anything listening. In that case the oldest samples
+	// go, so what the host finally reads is the most recent audio rather than
+	// a stale third of a second.
+	static constexpr std::size_t AUDIO_BUFFER_SIZE = 16384;
+
+	int m_audio_rate = DEFAULT_AUDIO_RATE;
+	u64 m_audio_time_ns = 0;   // emulated time the buffer has been filled to
+	u64 m_audio_frac = 0;      // and the sub-sample remainder of that
+
+	float m_audio_buffer[AUDIO_BUFFER_SIZE];
+	u64 m_audio_written = 0;   // monotonic; the buffer index is these mod SIZE
+	u64 m_audio_taken = 0;
+
+	double modem_dtmf_phase1 = 0, modem_dtmf_phase2 = 0, modem_beep_phase = 0;
 
 	void run_cpu(int cycles);
 };

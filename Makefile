@@ -18,7 +18,9 @@ CHARROM  := src/ts9347.bin
 EXPORTS := _mt_init,_mt_reset,_mt_rom_buffer,_mt_rom_buffer_size,_mt_load_rom, \
            _mt_run_frame,_mt_width,_mt_height,_mt_rgba,_mt_set_key, \
            _mt_release_all_keys,_mt_nvram,_mt_nvram_size,_mt_set_color, \
-           _mt_set_refresh_hz,_mt_refresh_hz
+           _mt_set_refresh_hz,_mt_refresh_hz, \
+           _mt_audio_rate,_mt_set_audio_rate,_mt_audio_buffer, \
+           _mt_audio_buffer_size,_mt_audio_read
 EXPORTS := $(subst $(subst ,, ),,$(EXPORTS))
 
 CXXFLAGS := -std=c++17 -Isrc/core -Ibuild -Wall
@@ -50,7 +52,7 @@ EMFLAGS := -Oz -DMINITEL_QUIET -fno-exceptions -fno-rtti \
            -s ASSERTIONS=0 \
            -s DISABLE_EXCEPTION_CATCHING=1 \
            -s EXPORTED_FUNCTIONS=$(EXPORTS) \
-           -s EXPORTED_RUNTIME_METHODS=HEAPU8 \
+           -s EXPORTED_RUNTIME_METHODS=HEAPU8,HEAPF32 \
            --no-entry \
            --closure 1
 

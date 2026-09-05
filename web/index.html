@@ -165,6 +165,20 @@
            + ', which is not a whole number of Hz between 1 and 1000 — using 50');
   }
 
+  // How loud the modem's monitor output is. The machine's own signal is
+  // full-scale -- the beep is a square wave that reaches both rails -- so 1
+  // would be as loud as the browser can make it; this is a level that sits
+  // alongside everything else on a page. 0 keeps the audio hardware asleep.
+  var VOLUME = 0.35;
+  if (CFG.volume !== undefined) {
+    var vol = Number(CFG.volume);
+    if (isFinite(vol) && vol >= 0 && vol <= 1)
+      VOLUME = vol;
+    else
+      warn('config.js volume is ' + JSON.stringify(CFG.volume)
+           + ', which is not a number between 0 and 1 — using ' + VOLUME);
+  }
+
   // The colour of the plastic moulding around the tube, as a CSS hex string.
   // These are display-referred values written straight to the framebuffer, so
   // the channels map to the shader by /255 with no transfer function applied.
@@ -251,7 +265,7 @@
 
   var canvas = document.getElementById("screen");
   var drop = document.getElementById("drop");
-  var Module = null, api = null, heap = null, running = false;
+  var Module = null, api = null, heap = null, heapf = null, running = false;
   var view = null, viewAt = -1, viewLen = 0;
 
   function bind(mod) {
@@ -269,6 +283,10 @@
       setColor: mod._mt_set_color,
       setRefreshHz: mod._mt_set_refresh_hz,
       refreshHz: mod._mt_refresh_hz,
+      setAudioRate: mod._mt_set_audio_rate,
+      audioRate: mod._mt_audio_rate,
+      audioBuffer: mod._mt_audio_buffer,
+      audioRead: mod._mt_audio_read,
       nvram: mod._mt_nvram,
       nvramSize: mod._mt_nvram_size
     };
@@ -328,6 +346,128 @@
   document.addEventListener("visibilitychange", function () {
     if (document.hidden) saveNvram();
   });
+
+  // ---------------------------------------------------------------------
+  // Sound.
+  //
+  // The Minitel's speaker is the modem's monitor output, and the core hands
+  // over what it carried, one emulated frame of samples at a time. Those go
+  // out as a queue of short buffers scheduled back to back against the audio
+  // clock: no worklet and no ScriptProcessor, because the machine is already
+  // being driven from the animation frame and the audio it just produced can
+  // simply be handed to the mixer at the same cadence, a little ahead of when
+  // it is due.
+  //
+  // That lead is the whole latency budget, and it exists because the audio
+  // clock does not wait for the page: it has to cover the longest gap between
+  // two animation frames -- a compositor hiccup, a slow frame, a collection --
+  // or the queue runs dry and the tone breaks up. A tenth of a second covers
+  // that with room left, and is short enough that a key and its tone still
+  // land together.
+  // ---------------------------------------------------------------------
+  function createAudio(volume) {
+    var LEAD = 0.10;        // how far ahead of the clock the queue is kept
+    var MIN_LEAD = 0.02;    // below this the next block would be scheduled late
+    var MAX_LEAD = 0.40;    // above it the page has run away from the clock
+
+    var ctx = null, gain = null, rate = 0, playAt = 0;
+    var off = false;        // no audio at all: not asked for, or not available
+
+    function open() {
+      if (off || ctx) return;
+
+      // volume 0 is the off switch, and it means the page never asks the
+      // browser for audio hardware at all.
+      if (!volume) { off = true; return; }
+
+      // A gesture can land before the module has finished loading. Leave it;
+      // boot opens the context itself, and the next gesture will start it.
+      if (!api) return;
+
+      var C = window.AudioContext || window.webkitAudioContext;
+      if (!C) { off = true; return; }
+      try {
+        // Older Safari's constructor takes no options object.
+        try { ctx = new C({ latencyHint: "interactive" }); }
+        catch (e) { ctx = new C(); }
+      } catch (e) {
+        warn("no audio: " + e);
+        off = true;
+        return;
+      }
+
+      gain = ctx.createGain();
+      gain.gain.value = volume;
+      gain.connect(ctx.destination);
+
+      // Generate at the mixer's own rate and nothing is resampled on the way
+      // out. The core keeps its own rate if it cannot work at that one, so
+      // read back what it settled on rather than assuming; the buffers carry
+      // that rate and the mixer resamples them if it has to.
+      api.setAudioRate(Math.round(ctx.sampleRate));
+      rate = api.audioRate();
+    }
+
+    function silent(at, n) {
+      for (var i = 0; i < n; i++)
+        if (heapf[at + i] !== 0) return false;
+      return true;
+    }
+
+    return {
+      // A browser will not start an audio context until the visitor has done
+      // something, and which gesture counts differs between them. Every one is
+      // another chance to try; once the context is running this does nothing.
+      unlock: function () {
+        open();
+        if (ctx && ctx.state !== "running") {
+          // Older Safari's resume() returns nothing rather than a promise.
+          var p = ctx.resume();
+          if (p && p.catch) p.catch(function () { /* not allowed yet; the next gesture tries again */ });
+        }
+      },
+
+      // Called once per animation frame, after the machine has run.
+      pump: function () {
+        if (off) return;
+
+        if (!ctx || ctx.state !== "running") {
+          // Nothing is listening yet. Still drain, so the core's buffer does
+          // not fill and start dropping, and so that when sound is finally
+          // allowed it starts from the machine's present rather than from a
+          // stale third of a second.
+          while (api.audioRead() > 0) { }
+          return;
+        }
+
+        var at = api.audioBuffer() >> 2;   // byte offset -> HEAPF32 index
+        var n;
+
+        while ((n = api.audioRead()) > 0) {
+          var now = ctx.currentTime;
+          if (playAt < now + MIN_LEAD || playAt > now + MAX_LEAD)
+            playAt = now + LEAD;
+
+          // Silence still advances the playhead -- that is what keeps one
+          // continuous timeline across a quiet passage, so a tone that starts
+          // needs no resynchronising -- but there is nothing to be gained by
+          // handing the mixer a buffer of zeros to play.
+          if (!silent(at, n)) {
+            var buf = ctx.createBuffer(1, n, rate);
+            buf.getChannelData(0).set(heapf.subarray(at, at + n));
+            var src = ctx.createBufferSource();
+            src.buffer = buf;
+            src.connect(gain);
+            src.start(playAt);
+          }
+
+          playAt += n / rate;
+        }
+      }
+    };
+  }
+
+  var audio = createAudio(VOLUME);
 
   // ---------------------------------------------------------------------
   // Main loop.
@@ -1440,6 +1580,9 @@
       while (pendingUp.length && pendingUp[0].at <= frameNo)
         pendingUp.shift().keys.forEach(keyUp);
     }
+
+    audio.pump();
+
     if (want) {
       // Phosphor decay runs on real elapsed time, so a dropped frame dims by
       // the right amount instead of by one frame's worth.
@@ -1602,6 +1745,12 @@
   window.addEventListener("pointerup", tapUp);
   window.addEventListener("pointercancel", tapUp);
   window.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+
+  // Capture, so this sees the gesture whatever else does with it.
+  ["pointerdown", "keydown", "touchend"].forEach(function (t) {
+    window.addEventListener(t, function () { audio.unlock(); }, true);
+  });
+
   window.focus();
 
   // ---------------------------------------------------------------------
@@ -1609,7 +1758,8 @@
   // ---------------------------------------------------------------------
   createMinitel().then(function (mod) {
     Module = mod;
-    heap = mod.HEAPU8;        // memory growth is off, so this view is stable
+    heap = mod.HEAPU8;        // memory growth is off, so these views are stable
+    heapf = mod.HEAPF32;
     api = bind(mod);
     mod._mt_init();
 
@@ -1621,6 +1771,12 @@
     if (MACHINE_HZ !== REFRESH_HZ)
       warn("the core kept " + MACHINE_HZ + " Hz rather than the requested " + REFRESH_HZ);
     pacer = createPacer(MACHINE_HZ);
+
+    // Before the first frame runs, so the machine generates at the output rate
+    // from the start. This also picks up a visitor who interacted with the
+    // page while it was still loading, which is early enough that the gesture
+    // listeners were not yet the ones that saw it.
+    audio.unlock();
 
     setCrt(crtOn);
     setBezel(bezelOn);

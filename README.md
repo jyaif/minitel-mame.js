@@ -36,7 +36,14 @@ It is MAME's `minitel2` driver, reduced to the parts the machine actually uses.
 | Intel 80C32 CPU @ 14.318 MHz | `src/devices/cpu/mcs51/` |
 | Thomson TS9347 video controller | `src/devices/video/ef9345.cpp` |
 | 24C02 I²C EEPROM | `src/devices/machine/i2cmem.cpp` |
-| Keyboard matrix, address decoding, timing | `src/mame/philips/minitel_2_rpic.cpp` |
+| Keyboard matrix, address decoding, timing, sound | `src/mame/philips/minitel_2_rpic.cpp` |
+
+Sound is the modem's monitor output, which is the only thing on this machine
+wired to a speaker: the TS7514 line interface can route what it is sending to
+it, and the firmware uses that for dialling tones and the call-progress beep. A
+program that drives the chip itself gets a sixteen-tone DTMF generator out of
+it. The page plays what the core produces at the mixer's own sample rate, so
+nothing is resampled on the way out.
 
 ## Layout
 
@@ -47,12 +54,12 @@ src/core/       the emulator
   mcs51ops.cpp    opcode implementations, verbatim from MAME
   ef9345.{h,cpp}  TS9347 video controller
   i2cmem.{h,cpp}  24C02 EEPROM
-  minitel.{h,cpp} the machine: memory map, ports, keyboard, timing
+  minitel.{h,cpp} the machine: memory map, ports, keyboard, timing, sound
 src/wasm/
   api.cpp         the C entry points the page calls
 src/ts9347.bin    the character generator ROM, compiled into the module
-web/              the page: WebGL CRT renderer, keyboard, ROM loading, EEPROM
-  config.js       display shortcut, video rate, bezel colour, touch keys
+web/              the page: WebGL CRT renderer, sound, keyboard, ROM, EEPROM
+  config.js       display shortcut, video rate, volume, bezel colour, touch keys
 tools/
   mkcharset.py    turn ts9347.bin into charset_rom.h, run by the Makefile
 ```
@@ -60,13 +67,15 @@ tools/
 ### Configuring it
 
 `web/config.js` holds the front-end settings — the display shortcut, the video
-rate, the colour of the moulding, and what tapping the screen sends:
+rate, how loud the speaker is, the colour of the moulding, and what tapping the
+screen sends:
 
 ```js
 window.MINITEL_CONFIG = {
   displayKey: "Tab",                 // null to disable; default "Backslash"
   displayMode: "bezel",              // which mode to start in
   refreshHz:  50,                    // 60 is MAME's value; default 50
+  volume:     0.35,                  // 0 to 1; 0 switches sound off
   bezelColor: "#121215",             // "#rgb" or "#rrggbb"
   tapKeys:    ["Space", "ArrowUp"]   // [] for no touch input
 };
@@ -81,9 +90,15 @@ page falls back to a 2D renderer with neither tube nor bezel, and the key
 alternates between the two colour modes.
 
 `refreshHz` is the one field that reaches into the emulation; the rest are the
-page's. `bezelColor` tints the moulding around the tube — the lit chamfer next
-to the glass, which is the whole of it — and only the WebGL renderer draws one;
-the 2D fallback has none.
+page's. `volume` is a plain gain on the machine's output, and that output is
+full-scale — the beep is a square wave that reaches both rails — so the default
+is well under 1. Browsers do not let a page make a sound before the visitor has
+interacted with it, so the first key or tap is what actually starts the audio;
+`volume: 0` opens no audio hardware at all.
+
+`bezelColor` tints the moulding around the tube — the lit chamfer next to the
+glass, which is the whole of it — and only the WebGL renderer draws one; the 2D
+fallback has none.
 
 Key names are either a `KeyboardEvent.code` or the label on the Minitel's own
 keys — `Suite`, `Retour`, `Envoi`, `Repetition`, `Tel`, `Guide`, `Sommaire`,

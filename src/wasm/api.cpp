@@ -31,6 +31,11 @@ u8 g_rom_buffer[0x10000];
 // Cropped, tightly packed RGBA for the canvas.
 u32 g_rgba[minitel_machine::SCREEN_WIDTH * minitel_machine::SCREEN_HEIGHT];
 
+// Where mt_audio_read() leaves what it drained. Big enough for the several
+// frames' worth a page can ask for after a stall -- 8192 samples is 170 ms at
+// 48 kHz -- so no realistic tick has to call twice.
+float g_audio[8192];
+
 } // anonymous namespace
 
 
@@ -131,6 +136,43 @@ EXPORT void mt_set_key(int row, int bit, int pressed)
 EXPORT void mt_release_all_keys()
 {
 	g_machine->release_all_keys();
+}
+
+// SOUND
+//
+// Mono samples, nominally in [-1, +1], at mt_audio_rate(). The machine
+// produces them continuously as it runs, silence included, so a drained frame
+// is a full frame's worth of samples that happen to be zero rather than
+// nothing at all -- which is what lets the page keep one audio timeline and
+// never have to splice.
+
+EXPORT int mt_audio_rate()
+{
+	return g_machine->audio_rate();
+}
+
+// Set this to the output rate the page is going to play at and nothing gets
+// resampled on the way out. Out-of-range values leave the rate alone, so the
+// page should read mt_audio_rate() back rather than assume.
+EXPORT void mt_set_audio_rate(int hz)
+{
+	g_machine->set_audio_rate(hz);
+}
+
+EXPORT float *mt_audio_buffer()
+{
+	return g_audio;
+}
+
+EXPORT int mt_audio_buffer_size()
+{
+	return int(sizeof(g_audio) / sizeof(g_audio[0]));
+}
+
+// Move up to buffer-size samples into mt_audio_buffer() and say how many.
+EXPORT int mt_audio_read()
+{
+	return int(g_machine->audio_read(g_audio, sizeof(g_audio) / sizeof(g_audio[0])));
 }
 
 EXPORT u8 *mt_nvram()

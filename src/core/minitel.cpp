@@ -11,6 +11,9 @@
 
 namespace {
 
+// std::numbers::pi is C++20 and this builds as C++17.
+constexpr double PI = 3.14159265358979323846;
+
 // The driver's screen.set_visarea(2, 512-10, 0, 278-1). The video chip narrows
 // max_x to the width of the mode it is in.
 constexpr ts9347_device::rectangle SCREEN_VISAREA = { 2, 512 - 10, 0, 278 - 1 };
@@ -36,6 +39,28 @@ constexpr u8 TELETEL_GREY[8] = { 0, 80, 160, 230, 40, 120, 200, 255 };
 
 // Scanline timer: TIMER(...).configure_scanline(..., "screen", 0, 10)
 constexpr int SCANLINE_TIMER_PERIOD = 10;
+
+// sin(x) for x in [0, 2*PI), without libm.
+//
+// std::sin is the only thing in this build that would pull the C math library
+// into the module, and it costs about 7 KB of wasm -- a sixth of the whole
+// thing -- to generate two sine waves. This folds the quadrants onto
+// [-PI/2, PI/2] and evaluates the Taylor series there, where eleventh order is
+// enough for a worst-case error of 6e-8: 145 dB below the tone it is making,
+// and some 120 dB below the 16-bit sample it ends up in.
+double sine(double x)
+{
+	if (x > PI)
+		x -= 2.0 * PI;               // [-PI, PI]
+	if (x > PI / 2)
+		x = PI - x;                  // and the two outer quadrants reflect
+	else if (x < -PI / 2)
+		x = -PI - x;                 // onto the two inner ones
+
+	double const x2 = x * x;
+	return x * (1.0 + x2 * (-1.0 / 6 + x2 * (1.0 / 120 + x2 * (-1.0 / 5040
+	         + x2 * (1.0 / 362880 + x2 * (-1.0 / 39916800))))));
+}
 
 } // anonymous namespace
 
@@ -126,10 +151,29 @@ void minitel_machine::reset()
 	m_carrier_signal = 0;
 	m_carrier_edge_ns = CARRIER_LOW_NS;
 
+	// The TS7514 has no reset line on this board, so MAME's driver carries its
+	// registers across a soft reset. Here reset() is also how a freshly loaded
+	// ROM starts, and a machine that came up mid-tone would be a surprise, so
+	// they go back to their power-up values: monitor nothing, no tone.
+	modem_input_reg = 0;
+	modem_rdtmf_reg = 0;
+	modem_rwlo_reg = 0xF;
+	modem_rptf_reg = 0;
+
+	modem_dtmf_phase1 = 0;
+	modem_dtmf_phase2 = 0;
+	modem_beep_phase = 0;
+
 	m_time_ns = 0;
 	m_ns_frac = 0;
 	m_cycle_frac = 0;
 	m_cycle_debt = 0;
+
+	// Whatever was buffered belongs to the machine that just went away.
+	m_audio_time_ns = 0;
+	m_audio_frac = 0;
+	m_audio_written = 0;
+	m_audio_taken = 0;
 
 	m_ts9347.set_time(0);
 	m_maincpu.reset();
@@ -179,6 +223,20 @@ void minitel_machine::port1_w(u8 data)
 {
 	// PORT_1_MDM_TXD would drive the modem here, but no device is plugged into
 	// the modem port.
+
+	if ((port1 ^ data) & PORT_1_MDM_RTS)
+	{
+		// Generate audio until now using the old RTS value.
+		sound_update();
+
+		// If the modem is in control mode (DTMF=MCBC=0), PRD feeds the input
+		// shift register (clocked by RTS) that receives the next command to
+		// execute.
+		bool in_control_mode = (last_ctrl_reg & (CTRL_REG_DTMF | CTRL_REG_MCBC)) == 0;
+		bool rts_falling_edge = (data & PORT_1_MDM_RTS) == 0;
+		if (in_control_mode && rts_falling_edge)
+			modem_input_reg = ((data & PORT_1_MDM_PRD) ? 0x80 : 0) | (modem_input_reg >> 1);
+	}
 
 	if ((port1 ^ data) & PORT_1_KBLOAD)
 	{
@@ -239,7 +297,43 @@ u8 minitel_machine::port3_r()
 
 void minitel_machine::dev_ctrl_reg_w(offs_t offset, u8 data)
 {
-	last_ctrl_reg = data;
+	if (last_ctrl_reg != data)
+	{
+		if ((last_ctrl_reg ^ data) & (CTRL_REG_DTMF | CTRL_REG_MCBC))
+		{
+			// Generate audio until now using the old DTMF and MCBC values.
+			sound_update();
+
+			// If leaving control mode (no longer DTMF=MCBC=0), execute the
+			// command that was shifted in.
+			bool was_control_mode = (last_ctrl_reg & (CTRL_REG_DTMF | CTRL_REG_MCBC)) == 0;
+			if (was_control_mode)
+				modem_exec_command();
+		}
+
+		last_ctrl_reg = data;
+	}
+}
+
+void minitel_machine::modem_exec_command()
+{
+	u8 addr = (modem_input_reg >> 4) & 0x7;
+	u8 val = modem_input_reg & 0xf;
+
+	switch (addr)
+	{
+		case 0x1:
+			modem_rdtmf_reg = val;
+			break;
+		case 0x3:
+			modem_rwlo_reg = val;
+			break;
+		case 0x4:
+			modem_rptf_reg = val;
+			break;
+		default:
+			logerror("Unimplemented TS7514 addr: %X val: %X\n", addr, val);
+	}
 }
 
 u8 minitel_machine::dev_keyb_ser_r(offs_t offset)
@@ -289,6 +383,132 @@ void minitel_machine::set_key(int row, int bit, bool pressed)
 		m_io_kbd[row] &= ~(1 << bit);
 	else
 		m_io_kbd[row] |= (1 << bit);
+}
+
+
+/***************************************************************************
+    SOUND
+
+    The TS7514's monitor output, which is what the Minitel's speaker is wired
+    to. Two sources can reach it: the DTMF pair the chip is dialling with, and
+    a fixed "signalling frequency" beep. RWLO says which -- and the ranges do
+    not overlap, so at most one is audible at a time.
+***************************************************************************/
+
+void minitel_machine::set_audio_rate(int hz)
+{
+	// The lower bound keeps the tones below Nyquist; the upper one keeps
+	// one scanline's worth of samples a sane number.
+	if (hz < 8000 || hz > 96000)
+		return;
+
+	m_audio_rate = hz;
+	m_audio_frac = 0;
+}
+
+void minitel_machine::sound_push(float sample)
+{
+	m_audio_buffer[m_audio_written % AUDIO_BUFFER_SIZE] = sample;
+	m_audio_written++;
+
+	// Nobody is draining. Drop the oldest sample rather than the newest, so
+	// what is left is the audio nearest to now.
+	if (m_audio_written - m_audio_taken > AUDIO_BUFFER_SIZE)
+		m_audio_taken = m_audio_written - AUDIO_BUFFER_SIZE;
+}
+
+std::size_t minitel_machine::audio_read(float *dst, std::size_t max)
+{
+	std::size_t n = std::min(audio_available(), max);
+
+	for (std::size_t i = 0; i < n; i++)
+		dst[i] = m_audio_buffer[(m_audio_taken + i) % AUDIO_BUFFER_SIZE];
+
+	m_audio_taken += n;
+	return n;
+}
+
+// How many samples the elapsed time is worth, with the remainder carried so
+// the sample clock neither drifts nor rounds a whole scanline away.
+void minitel_machine::sound_update()
+{
+	if (m_time_ns <= m_audio_time_ns)
+		return;
+
+	u64 const ticks = (m_time_ns - m_audio_time_ns) * u64(m_audio_rate) + m_audio_frac;
+	m_audio_time_ns = m_time_ns;
+	m_audio_frac = ticks % 1000000000ull;
+
+	sound_generate(std::size_t(ticks / 1000000000ull));
+}
+
+// MAME's sound_stream_update(), writing into the buffer instead of a stream.
+void minitel_machine::sound_generate(std::size_t samples)
+{
+	// In real hardware, DTMF tones are emitted on the phone line if DTMF=0,
+	// MCBC=1 and RTS=0. Given we only emulate the monitor output on the
+	// speaker, we also require that the transmit signal is selected for
+	// monitoring in RWLO.
+	bool dtmf_active =
+		(last_ctrl_reg & CTRL_REG_DTMF) == 0 &&
+		(last_ctrl_reg & CTRL_REG_MCBC) != 0 &&
+		(port1 & PORT_1_MDM_RTS) == 0 &&
+		modem_rwlo_reg <= 3;
+
+	// Tests if the "signalling-frequency" is selected for monitoring in RWLO.
+	// Note that "beep_active" and "dtmf_active" are mutually exclusive due to
+	// the different RWLO ranges.
+	bool beep_active = 8 <= modem_rwlo_reg && modem_rwlo_reg <= 11;
+
+	if (!dtmf_active)
+	{
+		modem_dtmf_phase1 = 0;
+		modem_dtmf_phase2 = 0;
+	}
+
+	if (!beep_active)
+		modem_beep_phase = 0;
+
+	// The two frequencies selected by RDTMF.
+	const double LOW_FREQS[4] = { 697, 770, 852, 941 };
+	const double HIGH_FREQS[4] = { 1209, 1336, 1477, 1633 };
+	double const rate1 = 2.0 * PI * LOW_FREQS[bitswap<2>(modem_rdtmf_reg, 1, 0)] / m_audio_rate;
+	double const rate2 = 2.0 * PI * HIGH_FREQS[bitswap<2>(modem_rdtmf_reg, 3, 2)] / m_audio_rate;
+
+	// The fixed frequency.
+	const double BEEP_FREQ = 2982;
+	double const beep_rate = 2.0 * PI * BEEP_FREQ / m_audio_rate;
+
+	for (std::size_t i = 0; i < samples; i++)
+	{
+		// A stream MAME has not written to is silent, and so is this.
+		float out = 0;
+
+		if (dtmf_active)
+		{
+			double val = 0;
+			if (modem_rptf_reg != 0x4) // unless high-only filtered
+				val += sine(modem_dtmf_phase1);
+			if (modem_rptf_reg != 0x8) // unless low-only filtered
+				val += sine(modem_dtmf_phase2);
+			out = float(0.5 * val); // mixed sine waves
+			// MAME wraps these with fmod(); a step is always well under a
+			// full turn, so one subtraction is the same thing.
+			modem_dtmf_phase1 += rate1;
+			if (modem_dtmf_phase1 >= 2.0 * PI) modem_dtmf_phase1 -= 2.0 * PI;
+			modem_dtmf_phase2 += rate2;
+			if (modem_dtmf_phase2 >= 2.0 * PI) modem_dtmf_phase2 -= 2.0 * PI;
+		}
+
+		if (beep_active)
+		{
+			out = modem_beep_phase >= PI ? +1.0f : -1.0f; // square wave
+			modem_beep_phase += beep_rate;
+			if (modem_beep_phase >= 2.0 * PI) modem_beep_phase -= 2.0 * PI;
+		}
+
+		sound_push(out);
+	}
 }
 
 
@@ -358,6 +578,7 @@ void minitel_machine::run_scanline(int scanline)
 
 	m_time_ns = line_end;
 	m_ts9347.set_time(m_time_ns);
+	sound_update();
 }
 
 void minitel_machine::run_frame()

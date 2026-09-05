@@ -33,6 +33,15 @@ window.MINITEL_CONFIG = {
   // it changes how much work fits between two VSYNCs.
   refreshHz: 50,
 
+  // How loud the Minitel's speaker is, from 0 to 1. That speaker is the
+  // modem's monitor output -- dialling tones and the beep -- and the machine
+  // drives it at full scale, so 1 is as loud as the browser can play it. 0
+  // switches sound off entirely and no audio hardware is opened.
+  //
+  // Browsers do not let a page make a sound before the visitor has interacted
+  // with it, so the first key or tap is what actually starts the audio.
+  volume: 0.35,
+
   // Colour of the plastic moulding around the tube, as a CSS hex string.
   // The default is a near-black, slightly blue grey. Only the WebGL renderer
   // draws a bezel; the 2D fallback has none.
