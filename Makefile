@@ -2,9 +2,14 @@
 #
 #   make            build web/minitel.js + web/minitel.wasm
 #   make serve      build, then serve web/ on http://localhost:8000
+#   make serve-docs refresh docs/, then serve it on http://localhost:8001
 #   make dist       build and zip web/ for upload to itch.io
 #   make pages      build, then refresh docs/ for GitHub Pages
 #   make clean
+#
+# The two servers use different ports so both can run at once, which is the
+# point of having them: web/ is what you are editing, docs/ is what visitors
+# will get. Override with PORT= or DOCS_PORT=.
 
 CORE     := $(wildcard src/core/*.cpp)
 WASM_SRC := $(CORE) src/wasm/api.cpp
@@ -21,7 +26,12 @@ EXPORTS := _mt_init,_mt_reset,_mt_rom_buffer,_mt_rom_buffer_size,_mt_load_rom, \
            _mt_release_all_keys,_mt_nvram,_mt_nvram_size,_mt_set_color, \
            _mt_set_refresh_hz,_mt_refresh_hz, \
            _mt_audio_rate,_mt_set_audio_rate,_mt_audio_buffer, \
-           _mt_audio_buffer_size,_mt_audio_read
+           _mt_audio_buffer_size,_mt_audio_read, \
+           _mt_serial_set_baud,_mt_serial_baud,_mt_serial_set_format, \
+           _mt_serial_databits,_mt_serial_parity,_mt_serial_stopbits, \
+           _mt_serial_in_buffer,_mt_serial_in_buffer_size,_mt_serial_write, \
+           _mt_serial_out_buffer,_mt_serial_out_buffer_size,_mt_serial_read, \
+           _mt_serial_pending,_mt_serial_errors
 EXPORTS := $(subst $(subst ,, ),,$(EXPORTS))
 
 CXXFLAGS := -std=c++17 -Isrc/core -Ibuild -Wall
@@ -57,7 +67,12 @@ EMFLAGS := -Oz -DMINITEL_QUIET -fno-exceptions -fno-rtti \
            --no-entry \
            --closure 1
 
-.PHONY: all serve dist pages clean
+# A page cannot be opened over file:// -- the module is fetched, so it needs an
+# origin. Both defaults are arbitrary; they differ only so the two can coexist.
+PORT      ?= 8000
+DOCS_PORT ?= 8001
+
+.PHONY: all serve serve-docs dist pages clean
 
 all: web/minitel.js
 
@@ -71,8 +86,16 @@ $(CHARSET): $(CHARROM) tools/mkcharset.py
 	python3 tools/mkcharset.py $(CHARROM) $@
 
 serve: all
-	@echo "http://localhost:8000/"
-	cd web && python3 -m http.server 8000
+	@echo "http://localhost:$(PORT)/"
+	cd web && python3 -m http.server $(PORT)
+
+# The published page, as it will actually be served: docs/ keeps its own
+# config.js and its own ROMs, so this is the only way to see what a visitor
+# gets rather than what web/ happens to be set up for. Depends on pages so the
+# build under test is never a stale copy.
+serve-docs: pages
+	@echo "http://localhost:$(DOCS_PORT)/"
+	cd docs && python3 -m http.server $(DOCS_PORT)
 
 dist: all
 	@rm -f build/minitel-web.zip

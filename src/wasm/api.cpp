@@ -36,6 +36,12 @@ u32 g_rgba[minitel_machine::SCREEN_WIDTH * minitel_machine::SCREEN_HEIGHT];
 // 48 kHz -- so no realistic tick has to call twice.
 float g_audio[8192];
 
+// Staging for the rear serial port, in both directions. A frame at 1200 baud
+// carries two or three bytes, so these are far larger than a tick needs; the
+// inbound one is sized for a page handing over a whole network burst at once.
+u8 g_serial_in[16384];
+u8 g_serial_out[4096];
+
 } // anonymous namespace
 
 
@@ -173,6 +179,98 @@ EXPORT int mt_audio_buffer_size()
 EXPORT int mt_audio_read()
 {
 	return int(g_machine->audio_read(g_audio, sizeof(g_audio) / sizeof(g_audio[0])));
+}
+
+// PERI-INFORMATIQUE
+//
+// The rear DIN socket as a byte pipe. The core does the framing -- start bit,
+// seven data bits, even parity, stop bit at 1200 baud by default -- so what
+// crosses this boundary is just the bytes, which is also exactly what a
+// videotex service sends over a websocket.
+
+EXPORT void mt_serial_set_baud(int baud)
+{
+	g_machine->serial_set_baud(baud);
+}
+
+EXPORT int mt_serial_baud()
+{
+	return g_machine->serial_baud();
+}
+
+// databits 7 or 8, parity 0 none / 1 odd / 2 even, stopbits 1 or 2. Out-of-
+// range values leave the format alone, so the page should read the settings
+// back rather than assume they took.
+EXPORT void mt_serial_set_format(int databits, int parity, int stopbits)
+{
+	g_machine->serial_set_format(databits, parity, stopbits);
+}
+
+EXPORT int mt_serial_databits()
+{
+	return g_machine->serial_databits();
+}
+
+EXPORT int mt_serial_parity()
+{
+	return g_machine->serial_parity();
+}
+
+EXPORT int mt_serial_stopbits()
+{
+	return g_machine->serial_stopbits();
+}
+
+EXPORT u8 *mt_serial_in_buffer()
+{
+	return g_serial_in;
+}
+
+EXPORT int mt_serial_in_buffer_size()
+{
+	return int(sizeof(g_serial_in));
+}
+
+// The page writes n bytes into mt_serial_in_buffer() and calls this. The
+// return is how many were taken: the line runs at 120 bytes a second and a
+// service can deliver a page in one burst, so a short write is the ordinary
+// case and the page is expected to keep the rest and offer it again.
+EXPORT int mt_serial_write(int n)
+{
+	if (n <= 0 || n > int(sizeof(g_serial_in)))
+		return 0;
+
+	return int(g_machine->serial_write(g_serial_in, std::size_t(n)));
+}
+
+EXPORT u8 *mt_serial_out_buffer()
+{
+	return g_serial_out;
+}
+
+EXPORT int mt_serial_out_buffer_size()
+{
+	return int(sizeof(g_serial_out));
+}
+
+// Move what the machine has transmitted into mt_serial_out_buffer() and say
+// how many bytes that was.
+EXPORT int mt_serial_read()
+{
+	return int(g_machine->serial_read(g_serial_out, sizeof(g_serial_out)));
+}
+
+// Bytes handed over but not yet shifted out onto the line.
+EXPORT int mt_serial_pending()
+{
+	return int(g_machine->serial_pending());
+}
+
+// Frames the sampler rejected. Climbing steadily means the baud rate or the
+// format disagrees with what the firmware programmed.
+EXPORT int mt_serial_errors()
+{
+	return int(g_machine->serial_errors());
 }
 
 EXPORT u8 *mt_nvram()

@@ -139,8 +139,9 @@ void minitel_machine::reset()
 	m_ts9347.reset();
 
 	port1 = 0;
-	// The rear serial port has nothing plugged into it, so its RXD sits at the
-	// idle mark; MAME's rs232_port_device reports that at reset.
+	// RXD sits at the idle mark until something drives it, which is what
+	// MAME's rs232_port_device reports at reset and what an empty socket
+	// looks like here too.
 	port3 = PORT_3_SER_RXD;
 
 	keyboard_para_ser = 0;
@@ -163,6 +164,17 @@ void minitel_machine::reset()
 	modem_dtmf_phase1 = 0;
 	modem_dtmf_phase2 = 0;
 	modem_beep_phase = 0;
+
+	// The line goes idle and both queues go with it. A reset is how a freshly
+	// loaded ROM starts, and bytes still in flight were addressed to the
+	// machine that has just gone away: a half-delivered videotex page handed
+	// to its successor is not a page, it is the middle of one.
+	serial_reset_line();
+	m_ser_in_w = m_ser_in_r = 0;
+	m_ser_out_w = m_ser_out_r = 0;
+	m_serial_next_ns = 0;
+	m_serial_frac = 0;
+	m_ser_rx_errors = 0;
 
 	m_time_ns = 0;
 	m_ns_frac = 0;
@@ -257,9 +269,24 @@ void minitel_machine::port1_w(u8 data)
 
 void minitel_machine::port3_w(u8 data)
 {
-	// PORT_3_SER_TXD would drive the rear serial port, which is unconnected.
+	// The rear port's TXD, which MAME hands to the rs232 bus here. Only the
+	// level is recorded: this runs on every bit the UART shifts and on every
+	// write to P3 besides, and the sampler that turns those levels into bytes
+	// has its own clock. serial_update() reads m_ser_txd at each of its ticks.
+	m_ser_txd = (data & PORT_3_SER_TXD) ? 1 : 0;
 
+	// RXD is an input, so a write to P3 must not disturb it.
 	port3 = (port3 & PORT_3_SER_RXD) | (data & ~PORT_3_SER_RXD);
+}
+
+// The other end of the cable driving the machine's RXD, which is what MAME's
+// rxd_handler does for the socket.
+void minitel_machine::serial_rxd(int state)
+{
+	if (state)
+		port3 |= PORT_3_SER_RXD;
+	else
+		port3 &= ~PORT_3_SER_RXD;
 }
 
 void minitel_machine::update_modem_state()
@@ -383,6 +410,260 @@ void minitel_machine::set_key(int row, int bit, bool pressed)
 		m_io_kbd[row] &= ~(1 << bit);
 	else
 		m_io_kbd[row] |= (1 << bit);
+}
+
+
+/***************************************************************************
+    PERI-INFORMATIQUE
+***************************************************************************/
+
+namespace {
+
+// The bit an even- or odd-parity line would send for this data.
+int serial_parity_bit(u8 v, int databits, int parity)
+{
+	int ones = 0;
+	for (int i = 0; i < databits; i++)
+		if (v & (1u << i))
+			ones++;
+
+	// Even parity makes the number of ones, the parity bit included, even.
+	return (parity == 2) ? (ones & 1) : !(ones & 1);
+}
+
+} // anonymous namespace
+
+int minitel_machine::serial_frame_bits() const
+{
+	return 1 + m_serial_databits + (m_serial_parity ? 1 : 0) + m_serial_stopbits;
+}
+
+void minitel_machine::serial_reset_line()
+{
+	m_ser_tx_frame = ~0u;
+	m_ser_tx_left = 0;
+	m_ser_tx_phase = 0;
+	serial_rxd(1);
+
+	m_ser_rx_state = 0;
+	m_ser_rx_cnt = 0;
+	m_ser_rx_idx = 0;
+	m_ser_rx_data = 0;
+	m_ser_rx_par = 0;
+}
+
+void minitel_machine::serial_set_baud(int baud)
+{
+	// The floor and ceiling are what the scanline-resolution sampler can
+	// actually hold on to; see the note on SERIAL_OVERSAMPLE.
+	if (baud < 50 || baud > 4800 || baud == m_serial_baud)
+		return;
+
+	m_serial_baud = baud;
+
+	// The pending tick belongs to the old rate, so start counting afresh
+	// rather than letting a stale deadline fire at the new one.
+	m_serial_next_ns = m_time_ns;
+	m_serial_frac = 0;
+	serial_reset_line();
+}
+
+void minitel_machine::serial_set_format(int databits, int parity, int stopbits)
+{
+	if (databits < 7 || databits > 8) return;
+	if (parity < 0 || parity > 2) return;
+	if (stopbits < 1 || stopbits > 2) return;
+
+	m_serial_databits = databits;
+	m_serial_parity = parity;
+	m_serial_stopbits = stopbits;
+	serial_reset_line();
+}
+
+std::size_t minitel_machine::serial_write(const u8 *data, std::size_t n)
+{
+	std::size_t const room = SERIAL_IN_SIZE - std::size_t(m_ser_in_w - m_ser_in_r);
+	std::size_t const take = std::min(n, room);
+
+	for (std::size_t i = 0; i < take; i++)
+		m_ser_in[(m_ser_in_w + i) % SERIAL_IN_SIZE] = data[i];
+	m_ser_in_w += take;
+
+	return take;
+}
+
+std::size_t minitel_machine::serial_read(u8 *dst, std::size_t max)
+{
+	std::size_t const have = std::size_t(m_ser_out_w - m_ser_out_r);
+	std::size_t const take = std::min(max, have);
+
+	for (std::size_t i = 0; i < take; i++)
+		dst[i] = m_ser_out[(m_ser_out_r + i) % SERIAL_OUT_SIZE];
+	m_ser_out_r += take;
+
+	return take;
+}
+
+// Take the next queued byte and lay it out as bits on the wire, oldest bit in
+// bit 0 so that shifting right walks the frame. Everything above the stop bits
+// is ones, which is what leaves the line idling high when the frame runs out.
+bool minitel_machine::serial_load_frame()
+{
+	if (m_ser_in_r == m_ser_in_w)
+		return false;
+
+	u8 const byte = m_ser_in[m_ser_in_r % SERIAL_IN_SIZE];
+	m_ser_in_r++;
+
+	int const nd = m_serial_databits;
+	u8 const data = u8(byte & ((1u << nd) - 1)); // a seven-bit line drops bit 7
+
+	u32 frame = 0;
+	int pos = 1;                                 // bit 0 stays clear: the start bit
+
+	for (int i = 0; i < nd; i++, pos++)
+		if (data & (1u << i))
+			frame |= 1u << pos;
+
+	if (m_serial_parity)
+	{
+		if (serial_parity_bit(data, nd, m_serial_parity))
+			frame |= 1u << pos;
+		pos++;
+	}
+
+	for (int i = 0; i < m_serial_stopbits; i++, pos++)
+		frame |= 1u << pos;
+
+	frame |= ~0u << pos;
+
+	m_ser_tx_frame = frame;
+	m_ser_tx_left = serial_frame_bits();
+	return true;
+}
+
+void minitel_machine::serial_tick()
+{
+	// ---- host to machine: drive RXD ----
+	if (m_ser_tx_left > 0 && --m_ser_tx_phase == 0)
+	{
+		m_ser_tx_frame >>= 1;
+		if (--m_ser_tx_left > 0)
+		{
+			m_ser_tx_phase = SERIAL_OVERSAMPLE;
+			serial_rxd(m_ser_tx_frame & 1);
+		}
+	}
+
+	// A frame that has just finished is followed straight away by the next
+	// one, with no idle bit between: at 1200 baud a page takes long enough to
+	// arrive without inserting gaps that the hardware would not have.
+	if (m_ser_tx_left == 0)
+	{
+		serial_rxd(1);
+		if (serial_load_frame())
+		{
+			m_ser_tx_phase = SERIAL_OVERSAMPLE;
+			serial_rxd(m_ser_tx_frame & 1);
+		}
+	}
+
+	// ---- machine to host: sample TXD ----
+	//
+	// The ordinary asynchronous recipe, and the same one the 80C32's own
+	// receiver runs: find the start bit's edge, step half a bit to its middle,
+	// then take every following bit a whole bit apart. Sampling in the middle
+	// is what buys the tolerance for the line's coarse timing.
+	int const level = m_ser_txd;
+
+	switch (m_ser_rx_state)
+	{
+	case 0: // idle, watching for a start bit
+		if (!level)
+		{
+			m_ser_rx_state = 1;
+			m_ser_rx_cnt = 0;
+		}
+		break;
+
+	case 1: // half a bit in, the start bit should still be there
+		if (++m_ser_rx_cnt >= SERIAL_OVERSAMPLE / 2)
+		{
+			m_ser_rx_cnt = 0;
+			if (level)
+			{
+				m_ser_rx_state = 0; // a glitch rather than a frame
+			}
+			else
+			{
+				m_ser_rx_state = 2;
+				m_ser_rx_idx = 0;
+				m_ser_rx_data = 0;
+			}
+		}
+		break;
+
+	case 2: // data, least significant bit first
+		if (++m_ser_rx_cnt >= SERIAL_OVERSAMPLE)
+		{
+			m_ser_rx_cnt = 0;
+			if (level)
+				m_ser_rx_data = u8(m_ser_rx_data | (1u << m_ser_rx_idx));
+			if (++m_ser_rx_idx >= m_serial_databits)
+				m_ser_rx_state = m_serial_parity ? 3 : 4;
+		}
+		break;
+
+	case 3: // parity
+		if (++m_ser_rx_cnt >= SERIAL_OVERSAMPLE)
+		{
+			m_ser_rx_cnt = 0;
+			m_ser_rx_par = level;
+			m_ser_rx_state = 4;
+		}
+		break;
+
+	case 4: // stop, which is the machine's claim that the frame was whole
+		if (++m_ser_rx_cnt >= SERIAL_OVERSAMPLE)
+		{
+			m_ser_rx_cnt = 0;
+			m_ser_rx_state = 0;
+
+			bool good = level != 0;
+			if (good && m_serial_parity)
+				good = m_ser_rx_par == serial_parity_bit(m_ser_rx_data, m_serial_databits, m_serial_parity);
+
+			if (!good)
+				m_ser_rx_errors++;
+			else if (std::size_t(m_ser_out_w - m_ser_out_r) < SERIAL_OUT_SIZE)
+			{
+				m_ser_out[m_ser_out_w % SERIAL_OUT_SIZE] = m_ser_rx_data;
+				m_ser_out_w++;
+			}
+			// else the host is not draining; the keystroke goes nowhere,
+			// which is better than losing the oldest one it has yet to read.
+		}
+		break;
+	}
+}
+
+void minitel_machine::serial_update()
+{
+	u64 const den = u64(m_serial_baud) * SERIAL_OVERSAMPLE;
+
+	while (m_serial_next_ns <= m_time_ns)
+	{
+		serial_tick();
+
+		u64 step = 1000000000ull / den;
+		m_serial_frac += u32(1000000000ull % den);
+		if (m_serial_frac >= den)
+		{
+			m_serial_frac -= u32(den);
+			step++;
+		}
+		m_serial_next_ns += step;
+	}
 }
 
 
@@ -579,6 +860,7 @@ void minitel_machine::run_scanline(int scanline)
 	m_time_ns = line_end;
 	m_ts9347.set_time(m_time_ns);
 	sound_update();
+	serial_update();
 }
 
 void minitel_machine::run_frame()

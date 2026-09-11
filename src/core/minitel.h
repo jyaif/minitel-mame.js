@@ -23,11 +23,17 @@
 //
 // What MAME's driver has and this build drops:
 //
-//  - The modem and the rear serial port (prise peri-informatique) as serial
-//    links. MAME configures both RS232 ports with no device plugged in, which
-//    leaves RXD idle high on each; that is reproduced here as a constant, so
-//    what the firmware reads on P1/P3 and on INT1 is unchanged. The modem's
-//    audio side is emulated -- see the sound section below.
+//  - The modem as a serial link. MAME configures its RS232 port with no device
+//    plugged in, which leaves RXD idle high; that is reproduced here as a
+//    constant, so what the firmware reads on P1 and on INT1 is unchanged. The
+//    modem's audio side is emulated -- see the sound section below.
+//
+// What this build has that MAME gets from a bus device:
+//
+//  - The rear serial port (prise peri-informatique) is a real link. MAME hands
+//    the pins to an rs232_port_device and lets diserial do the framing; there
+//    is no device bus here, so the line discipline is open-coded -- see the
+//    serial section below.
 
 #ifndef MINITEL_MINITEL_H
 #define MINITEL_MINITEL_H
@@ -135,6 +141,58 @@ public:
 	u8 *nvram() { return m_i2cmem.data(); }
 	static constexpr std::size_t NVRAM_SIZE = i2c_24c02_device::DATA_SIZE;
 
+	// PERI-INFORMATIQUE
+	//
+	// The rear DIN socket, on the 80C32's own UART: P3.0 is RXD and P3.1 TXD,
+	// and the firmware clocks both off timer 1. The CPU core already shifts
+	// the bits -- it samples RXD straight out of port3_r() and drives TXD
+	// through port3_w() -- so what is missing is only the other end of the
+	// cable, which is what this is.
+	//
+	// The defaults are the ones MAME's driver declares for this socket:
+	// 1200 baud, seven data bits, even parity, one stop bit. They have to
+	// agree with what the firmware programmed, since nothing here can
+	// discover the rate the machine is actually running at.
+	//
+	// The names are from the machine's point of view rather than the pins':
+	// serial_write() is what the host sends and the machine receives, and
+	// serial_read() is what the machine transmitted.
+
+	static constexpr int SERIAL_DEFAULT_BAUD = 1200;
+
+	// Out-of-range values are ignored, so the accessors are the settings in
+	// effect. Changing either resets the line to idle and drops whatever was
+	// half-shifted, since a frame that straddles a format change is garbage
+	// either way.
+	void serial_set_baud(int baud);
+	int serial_baud() const { return m_serial_baud; }
+
+	// databits 7 or 8, parity 0 none / 1 odd / 2 even, stopbits 1 or 2.
+	void serial_set_format(int databits, int parity, int stopbits);
+	int serial_databits() const { return m_serial_databits; }
+	int serial_parity() const { return m_serial_parity; }
+	int serial_stopbits() const { return m_serial_stopbits; }
+
+	// Queue bytes for the machine to receive, returning how many were taken.
+	// A short write means the queue is full, which is the normal state of
+	// affairs when a page arrives over a network faster than 120 bytes a
+	// second: the caller keeps the remainder and offers it again rather than
+	// dropping it, because a dropped byte in a videotex stream is not a
+	// dropped byte but a corrupted screen.
+	std::size_t serial_write(const u8 *data, std::size_t n);
+
+	// Take what the machine has transmitted, oldest first.
+	std::size_t serial_read(u8 *dst, std::size_t max);
+
+	// Bytes queued but not yet shifted out, so a host can tell the difference
+	// between "sent" and "sent and gone down the wire".
+	std::size_t serial_pending() const { return std::size_t(m_ser_in_w - m_ser_in_r); }
+
+	// Frames the sampler threw away: a stop bit that was not there, or a
+	// parity bit that disagreed. Steadily climbing means the baud rate or the
+	// format does not match what the firmware is using.
+	u32 serial_errors() const { return m_ser_rx_errors; }
+
 private:
 	// 14174 Control register bits definition
 	enum
@@ -180,6 +238,15 @@ private:
 
 	void update_modem_state();
 	void modem_exec_command();
+
+	// Bring the serial line up to m_time_ns. Called once per scanline, which
+	// is the resolution the line runs at -- see the note on the members.
+	void serial_update();
+	void serial_tick();
+	void serial_rxd(int state);
+	bool serial_load_frame();
+	void serial_reset_line();
+	int serial_frame_bits() const;
 
 	// Bring the audio buffer up to m_time_ns using the state in effect over
 	// the span, then let the caller change that state -- the same discipline
@@ -274,6 +341,61 @@ private:
 	u64 m_audio_taken = 0;
 
 	double modem_dtmf_phase1 = 0, modem_dtmf_phase2 = 0, modem_beep_phase = 0;
+
+	// PERI-INFORMATIQUE
+	//
+	// Both directions run off a tick at sixteen times the bit rate, which is
+	// what the 80C32's own receiver oversamples at and what makes a start bit
+	// findable without a shared clock. Ticks are counted from emulated time
+	// rather than accumulated, so the line cannot drift against the CPU.
+	//
+	// serial_update() runs at the end of each scanline, so a level the machine
+	// puts on TXD is seen up to one scanline late -- 64 us at 50 Hz, against a
+	// 833 us bit at 1200 baud. The sampler looks at the middle of each bit, so
+	// it has half a bit of margin either side and 64 us of slop is nothing.
+	// That margin is what sets the usable ceiling: 4800 baud still has 208 us
+	// bits and is comfortable, 9600 would be sampling a 104 us bit through a
+	// 64 us window and is not.
+	static constexpr int SERIAL_OVERSAMPLE = 16;
+
+	// Sized for the two directions' very different jobs. Inbound is a videotex
+	// page arriving in one network burst and draining at 120 bytes a second,
+	// so it holds several minutes' worth; outbound is keystrokes.
+	static constexpr std::size_t SERIAL_IN_SIZE  = 65536;
+	static constexpr std::size_t SERIAL_OUT_SIZE = 4096;
+
+	int m_serial_baud = SERIAL_DEFAULT_BAUD;
+	int m_serial_databits = 7;
+	int m_serial_parity = 2;   // even
+	int m_serial_stopbits = 1;
+
+	// When the next tick falls, carrying its remainder the way the scanline
+	// and cycle counters do, so the line's clock neither drifts against the
+	// CPU's nor overflows on a long session.
+	u64 m_serial_next_ns = 0;
+	u32 m_serial_frac = 0;
+
+	// Host to machine: the shifter driving RXD. The frame is held with the
+	// next bit to go out in bit 0, so shifting right walks it, and the top is
+	// padded with ones so an emptied shifter idles high on its own.
+	u32 m_ser_tx_frame = ~0u;
+	int m_ser_tx_left = 0;
+	int m_ser_tx_phase = 0;
+
+	// Machine to host: the sampler watching TXD. m_ser_txd is the live level,
+	// written by port3_w as the CPU shifts, and read at each tick.
+	int m_ser_txd = 1;
+	int m_ser_rx_state = 0;    // 0 idle, 1 start, 2 data, 3 parity, 4 stop
+	int m_ser_rx_cnt = 0;
+	int m_ser_rx_idx = 0;
+	u8  m_ser_rx_data = 0;
+	int m_ser_rx_par = 0;
+	u32 m_ser_rx_errors = 0;
+
+	u8 m_ser_in[SERIAL_IN_SIZE];
+	u64 m_ser_in_w = 0, m_ser_in_r = 0;
+	u8 m_ser_out[SERIAL_OUT_SIZE];
+	u64 m_ser_out_w = 0, m_ser_out_r = 0;
 
 	void run_cpu(int cycles);
 };

@@ -75,6 +75,58 @@
   }
   #roms.on { display: block; }
   #roms:hover, #roms:focus { opacity: 1; }
+
+  /* Buttons for combinations the browser cannot deliver: Fnct+P and the rest
+     are chords on the Minitel's own keyboard, and a browser either swallows
+     the modifier or has no key to stand for it. Present only when config.js
+     asks for them, and with the ROM menu's manners -- over the picture, since
+     the frame is letterboxed and there is no room beside it, and dimmed until
+     wanted so a page that shows one game is not asking to be clicked. */
+  #keys {
+    position: fixed;
+    left: 50%;
+    bottom: 10px;
+    transform: translateX(-50%);
+    z-index: 1;
+    display: none;
+    gap: 6px;
+    flex-wrap: wrap;
+    justify-content: center;
+    max-width: 92vw;
+    opacity: .45;
+    transition: opacity .15s;
+  }
+  #keys.on { display: flex; }
+  #keys:hover, #keys:focus-within { opacity: 1; }
+  #keys button {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1px;
+    padding: 5px 10px;
+    border: 1px solid #4a3c2c;
+    border-radius: 8px;
+    background: #000a;
+    color: #d8cbb4;
+    font: 12px/1.15 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    cursor: pointer;
+    touch-action: none;
+  }
+  /* The key it stands for. Quieter than the name: it is a reminder of how to
+     press this without the mouse, which is the only way to hold two at once. */
+  #keys button .sc {
+    font-size: 10px;
+    opacity: .55;
+  }
+  #keys button:active .sc { opacity: .8; }
+  /* Latched: a sticky key that is being held for the next keystroke. */
+  #keys button.held {
+    background: #4a3c2c;
+    color: #fff;
+    border-color: #8d7f68;
+  }
+  #keys button.held .sc { opacity: .85; }
+  #keys button:active { background: #4a3c2c; color: #fff; }
 </style>
 </head>
 <body>
@@ -91,6 +143,7 @@
 
 <!-- After #drop, so it stays reachable while the drop panel is up. -->
 <select id="roms" aria-label="ROM"></select>
+<div id="keys"></div>
 
 <script src="config.js"></script>
 <script src="minitel.js"></script>
@@ -260,6 +313,89 @@
   // extension, labels it in the menu. With nothing configured the page looks
   // for rom.bin next to itself, which is how a single game ships.
   // ---------------------------------------------------------------------
+  // The rear serial port, which is configured per ROM: a page can carry a game
+  // that wants nothing plugged in next to a terminal ROM that dials a videotex
+  // service, and switching between them should plug and unplug the cable.
+  //
+  // A setting is a websocket URL, or an object that gives the line as well.
+  // undefined means "not stated", so a ROM entry inherits whatever the page
+  // named; null or false means "nothing plugged in", which is how one entry
+  // opts out of a page-wide default.
+  function parseSerial(raw, where) {
+    if (raw === undefined) return undefined;
+    if (raw === null || raw === false) return null;
+
+    var sc = (typeof raw === "string") ? { url: raw } : raw;
+    if (!sc || typeof sc !== "object" || !sc.url) {
+      warn(where + " is " + JSON.stringify(raw)
+           + "; expected a websocket URL or an object with one. Ignored.");
+      return null;
+    }
+
+    var PARITIES = { none: 0, odd: 1, even: 2 };
+    var cfg = {
+      url: String(sc.url),
+      baud: sc.baud === undefined ? 1200 : Number(sc.baud),
+      databits: sc.databits === undefined ? 7 : Number(sc.databits),
+      stopbits: sc.stopbits === undefined ? 1 : Number(sc.stopbits),
+      parity: sc.parity === undefined ? 2
+              : (typeof sc.parity === "string"
+                 ? PARITIES[String(sc.parity).toLowerCase()]
+                 : Number(sc.parity))
+    };
+    if (cfg.parity === undefined || isNaN(cfg.parity)) {
+      warn(where + ".parity is " + JSON.stringify(sc.parity)
+           + '; expected "none", "odd" or "even". Using even.');
+      cfg.parity = 2;
+    }
+    // A page served over https cannot open a plaintext ws://, and the failure
+    // is silent, so say so rather than let it look like the service is down.
+    if (location.protocol === "https:" && /^ws:/i.test(cfg.url))
+      warn(where + ": " + cfg.url + " is plaintext ws:// on an https page,"
+           + " which browsers block. Use wss://.");
+    return cfg;
+  }
+
+  // What a ROM that names no socket of its own gets.
+  var SERIAL_DEFAULT = parseSerial(CFG.serial, "config.js serial");
+  if (SERIAL_DEFAULT === undefined) SERIAL_DEFAULT = null;
+
+  // Buttons for key combinations, which are per ROM for the same reason the
+  // socket is: the keys worth a button on a terminal ROM are not the ones a
+  // game wants, and a game usually wants none at all.
+  //
+  // An entry is a key name, or a { label, keys } pair whose keys is one name
+  // or a list pressed together. undefined means "not stated", so a ROM
+  // inherits the page's; an empty list means no buttons.
+  function parseKeyButtons(raw, where) {
+    if (raw === undefined) return undefined;
+    if (raw === null || raw === false) return [];
+
+    var list = [];
+    (Array.isArray(raw) ? raw : [raw]).forEach(function (entry) {
+      var e = (typeof entry === "string") ? { keys: entry } : entry;
+      if (!e || typeof e !== "object" || e.keys === undefined) {
+        warn(where + " has an entry that names no keys: " + JSON.stringify(entry));
+        return;
+      }
+      var names = (Array.isArray(e.keys) ? e.keys : [e.keys]).map(String);
+      // resolveKey() has already said which name it did not recognise; a
+      // button that would press only half a chord is worse than no button.
+      var keys = names.map(resolveKey);
+      if (!keys.length || keys.indexOf(null) !== -1) return;
+
+      list.push({
+        label: e.label !== undefined ? String(e.label) : names.join("+"),
+        keys: keys,
+        sticky: !!e.sticky
+      });
+    });
+    return list;
+  }
+
+  var KEY_BUTTONS_DEFAULT = parseKeyButtons(CFG.keyButtons, "config.js keyButtons");
+  if (KEY_BUTTONS_DEFAULT === undefined) KEY_BUTTONS_DEFAULT = [];
+
   var ROMS = [];
   if (CFG.roms !== undefined) {
     (Array.isArray(CFG.roms) ? CFG.roms : [CFG.roms]).forEach(function (entry) {
@@ -273,12 +409,19 @@
       file = String(file);
       var name = (entry && entry.name !== undefined) ? String(entry.name)
                  : file.replace(/^.*\//, "").replace(/\.[^.]*$/, "");
-      ROMS.push({ name: name, file: file, bytes: null });
+      var where = 'config.js roms entry "' + file + '"';
+      var ser = parseSerial(entry && entry.serial, where + " serial");
+      var kb = parseKeyButtons(entry && entry.keyButtons, where + " keyButtons");
+      ROMS.push({ name: name, file: file, bytes: null,
+                  serial: ser === undefined ? SERIAL_DEFAULT : ser,
+                  keyButtons: kb === undefined ? KEY_BUTTONS_DEFAULT : kb });
     });
     if (!ROMS.length)
       warn("config.js roms lists nothing loadable — looking for rom.bin");
   }
-  if (!ROMS.length) ROMS = [{ name: "rom", file: "rom.bin", bytes: null }];
+  if (!ROMS.length)
+    ROMS = [{ name: "rom", file: "rom.bin", bytes: null,
+              serial: SERIAL_DEFAULT, keyButtons: KEY_BUTTONS_DEFAULT }];
 
   // The 24C02 is the machine's own EEPROM, but a native ROM is free to keep
   // whatever it likes in there, so two games sharing one 256-byte image would
@@ -362,14 +505,27 @@
       audioBuffer: mod._mt_audio_buffer,
       audioRead: mod._mt_audio_read,
       nvram: mod._mt_nvram,
-      nvramSize: mod._mt_nvram_size
+      nvramSize: mod._mt_nvram_size,
+      serialSetBaud: mod._mt_serial_set_baud,
+      serialBaud: mod._mt_serial_baud,
+      serialSetFormat: mod._mt_serial_set_format,
+      serialDatabits: mod._mt_serial_databits,
+      serialParity: mod._mt_serial_parity,
+      serialStopbits: mod._mt_serial_stopbits,
+      serialInBuffer: mod._mt_serial_in_buffer,
+      serialInBufferSize: mod._mt_serial_in_buffer_size,
+      serialWrite: mod._mt_serial_write,
+      serialOutBuffer: mod._mt_serial_out_buffer,
+      serialRead: mod._mt_serial_read,
+      serialErrors: mod._mt_serial_errors
     };
   }
 
   // ---------------------------------------------------------------------
   // ROM loading
   // ---------------------------------------------------------------------
-  function loadRom(bytes, file) {
+  function loadRom(bytes, rom) {
+    var file = rom.file;
     // The EEPROM of whatever was running, before the image that owns it is
     // replaced. Nothing has run yet on the first load, so there is nothing to
     // write and the blank 256 bytes must not be saved over a real one.
@@ -379,8 +535,13 @@
     if (bytes.length > max) bytes = bytes.subarray(0, max);
     heap.set(bytes, api.romBuffer());
     NVRAM_KEY = nvramKey(file);
-    api.loadRom(bytes.length);   // resets the machine, EEPROM included
+    api.loadRom(bytes.length);   // resets the machine, EEPROM and serial included
     restoreNvram();
+
+    // After the reset, so the line is configured on the machine that is going
+    // to use it and no byte of the last one's traffic survives the swap.
+    applySerial(rom.serial);
+    applyKeyButtons(rom.keyButtons);
 
     // A key held across the swap would be held down on a machine that has just
     // come up, and the new ROM would never see it released.
@@ -397,7 +558,7 @@
   // missing.
   function fetchRom(rom) {
     if (rom.bytes) {
-      loadRom(rom.bytes, rom.file);
+      loadRom(rom.bytes, rom);
       return Promise.resolve();
     }
     return fetch(rom.file, { cache: "no-cache" })
@@ -405,7 +566,7 @@
       .then(function (b) {
         var bytes = new Uint8Array(b);
         if (!bytes.length || bytes[0] === 0x3c) return Promise.reject();
-        loadRom(bytes, rom.file);
+        loadRom(bytes, rom);
       });
   }
 
@@ -466,7 +627,8 @@
   function useDroppedRom(f) {
     f.arrayBuffer().then(function (b) {
       if (!dropped) {
-        dropped = { name: "", file: "", bytes: null };
+        dropped = { name: "", file: "", bytes: null,
+                    serial: SERIAL_DEFAULT, keyButtons: KEY_BUTTONS_DEFAULT };
         ROMS.push(dropped);
         if (menu) addOption(dropped);
       }
@@ -638,6 +800,118 @@
   }
 
   var audio = createAudio(VOLUME);
+
+  // ---------------------------------------------------------------------
+  // Peri-informatique, over a websocket
+  //
+  // The rear DIN socket carried a byte stream at 1200 baud, and a videotex
+  // service over a websocket is the same byte stream with a different cable.
+  // So this is a wire and nothing more: whatever arrives in a frame is handed
+  // to the core, whatever the machine transmits is sent back, and neither end
+  // is interpreted here.
+  //
+  // The line is far slower than the network, which is the whole reason the
+  // core reports a short write: a page arrives in one burst and then takes its
+  // own time going down the wire. What did not fit stays queued in the page.
+  // ---------------------------------------------------------------------
+  function createSerial(cfg) {
+    var url = String(cfg.url || "");
+    if (!url) return null;
+
+    var ws = null, queue = [], attempt = 0, timer = null, gone = false;
+
+    function state(txt) {
+      if (window.console) window.console.log("Minitel serial: " + txt);
+    }
+
+    function connect() {
+      timer = null;
+      try { ws = new WebSocket(url); } catch (e) {
+        warn("serial: " + url + " is not a usable websocket URL");
+        return;
+      }
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = function () { attempt = 0; state("connected to " + url); };
+
+      ws.onmessage = function (e) {
+        // A service may send text frames for what is really a byte stream, so
+        // take both; anything above 7 bits would not survive the line anyway.
+        var bytes;
+        if (typeof e.data === "string") {
+          bytes = new Uint8Array(e.data.length);
+          for (var i = 0; i < e.data.length; i++) bytes[i] = e.data.charCodeAt(i) & 0xff;
+        } else {
+          bytes = new Uint8Array(e.data);
+        }
+        if (bytes.length) queue.push(bytes);
+      };
+
+      ws.onclose = function () {
+        ws = null;
+        if (gone) return;
+        // Back off to a few seconds so a service that is down does not turn
+        // into a reconnect loop for as long as the page is open.
+        var wait = Math.min(1000 * (1 << Math.min(attempt++, 4)), 16000);
+        state("disconnected, retrying in " + (wait / 1000) + "s");
+        timer = setTimeout(connect, wait);
+      };
+
+      ws.onerror = function () { /* onclose does the recovering */ };
+    }
+
+    connect();
+
+    return {
+      // Called once per animation frame, after the machine has run.
+      pump: function () {
+        // Machine to service: keystrokes, and the terminal's own protocol
+        // replies, which is how a service learns what it is talking to.
+        var n = api.serialRead();
+        if (n > 0 && ws && ws.readyState === 1) {
+          var at = api.serialOutBuffer();
+          ws.send(heap.slice(at, at + n));
+        }
+
+        // Service to machine, for as much as the line can take right now.
+        var cap = api.serialInBufferSize();
+        while (queue.length) {
+          var chunk = queue[0];
+          var room = chunk.length < cap ? chunk.length : cap;
+          heap.set(chunk.subarray(0, room), api.serialInBuffer());
+          var took = api.serialWrite(room);
+          if (took <= 0) break;                 // the core is full; try next frame
+          if (took >= chunk.length) queue.shift();
+          else { queue[0] = chunk.subarray(took); break; }
+        }
+      },
+
+      close: function () { gone = true; if (timer) clearTimeout(timer); if (ws) ws.close(); }
+    };
+  }
+
+  var serial = null;
+
+  // Plug in whatever the ROM now running asks for, unplugging what was there.
+  // Called on every ROM swap, so a game and a terminal ROM on the same page
+  // each get their own socket -- or none.
+  function applySerial(cfg) {
+    if (serial) { serial.close(); serial = null; }
+    if (!cfg) return;
+
+    // The core is the authority on the line: it keeps its own settings if what
+    // it was handed is out of range, so read them back before saying anything.
+    api.serialSetBaud(cfg.baud);
+    api.serialSetFormat(cfg.databits, cfg.parity, cfg.stopbits);
+    var got  = api.serialBaud() + "/" + api.serialDatabits()
+             + ["N", "O", "E"][api.serialParity()] + api.serialStopbits();
+    var want = cfg.baud + "/" + cfg.databits
+             + ["N", "O", "E"][cfg.parity] + cfg.stopbits;
+    if (got !== want)
+      warn("the core kept the serial line at " + got + " rather than " + want);
+
+    serial = createSerial(cfg);
+  }
 
   // ---------------------------------------------------------------------
   // Main loop.
@@ -1752,6 +2026,7 @@
     }
 
     audio.pump();
+    if (serial) serial.pump();
 
     if (want) {
       // Phosphor decay runs on real elapsed time, so a dropped frame dims by
@@ -1819,6 +2094,22 @@
   var pendingUp = [];     // releases waiting out the minimum press
   var frameNo = 0;
 
+  // Buttons that latch: a modifier like Fonction is only useful held while
+  // something else is pressed, and a pointer cannot hold one button and press
+  // another. So it stays down until the next key has been and gone, the way a
+  // sticky modifier on any on-screen keyboard does.
+  var latched = [];
+
+  function releaseLatched() {
+    if (!latched.length) return;
+    var was = latched;
+    latched = [];
+    was.forEach(function (l) {
+      l.keys.forEach(keyUp);
+      l.el.classList.remove("held");
+    });
+  }
+
   function keyDown(entry) {
     if (!entry || !api) return;
     var k = entry[0] + "," + entry[1];
@@ -1837,6 +2128,8 @@
     held = {};
     pendingUp.length = 0;
     tapPointers = 0;
+    latched.forEach(function (l) { l.el.classList.remove("held"); });
+    latched = [];
     if (api) api.releaseAll();
   }
 
@@ -1868,6 +2161,8 @@
     if (!entry) return;
     e.preventDefault();
     keyUp(entry);
+    // The key a latched modifier was waiting for has been and gone.
+    releaseLatched();
   });
 
   // A key held when the page loses focus would stay stuck down.
@@ -1897,6 +2192,9 @@
     // would stop that.
     if (menu && menu.contains(e.target)) return;
 
+    // A tap on a key button is that button's, not the screen's.
+    if (keyBar && keyBar.contains(e.target)) return;
+
     // Inside an iframe the page receives no key events until it has focus, and
     // a visitor's first interaction with an embedded game is a click on it.
     // That click is only ever meant to focus the frame, so the mouse does not
@@ -1923,6 +2221,180 @@
   window.addEventListener("pointerdown", tapDown);
   window.addEventListener("pointerup", tapUp);
   window.addEventListener("pointercancel", tapUp);
+
+  // ---------------------------------------------------------------------
+  // Buttons for key combinations
+  //
+  // Some of what the Minitel's keyboard does needs a key a browser will not
+  // give you: Fonction held with a letter is a chord the system takes for
+  // itself, and the labelled keys down the side of the machine reach the page
+  // only as function keys, several of which the browser or the desktop has
+  // already claimed. A button presses the whole thing for as long as it is
+  // held, which is what the matrix would have seen.
+  //
+  // Rebuilt on every ROM swap, since the buttons belong to the ROM.
+  // ---------------------------------------------------------------------
+  var keyBar = document.getElementById("keys");
+
+  // Which key on the visitor's own keyboard reaches a given matrix cell.
+  // Built by reversing the two maps the keydown handler consults, so what a
+  // button advertises cannot drift from what actually works.
+  var SHORTCUTS = null;
+
+  function shortcutOf(entry) {
+    if (!SHORTCUTS) {
+      SHORTCUTS = {};
+      var k;
+      for (k in KEYMAP)
+        if (Object.prototype.hasOwnProperty.call(KEYMAP, k))
+          SHORTCUTS[KEYMAP[k][0] + "," + KEYMAP[k][1]] = k;
+      // Second, so that where both reach a cell the printed function key is
+      // the one shown.
+      for (k in FKEYS)
+        if (Object.prototype.hasOwnProperty.call(FKEYS, k))
+          SHORTCUTS[FKEYS[k][0] + "," + FKEYS[k][1]] = k;
+    }
+    return SHORTCUTS[entry[0] + "," + entry[1]] || "";
+  }
+
+  // A KeyboardEvent.code is not what is printed on the key.
+  var KEY_LABELS = {
+    AltRight: "Right Alt", Escape: "Esc", Delete: "Del", Space: "Space",
+    Enter: "Enter", Backspace: "Backspace", Backquote: "`", Quote: "'",
+    Comma: ",", Period: ".", Slash: "/",
+    ArrowUp: "↑", ArrowDown: "↓",
+    ArrowLeft: "←", ArrowRight: "→",
+    NumpadMultiply: "Num *", NumpadAdd: "Num +"
+  };
+
+  function keyLabel(code) {
+    if (KEY_LABELS[code]) return KEY_LABELS[code];
+    if (/^Key[A-Z]$/.test(code)) return code.slice(3);
+    if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+    return code;
+  }
+
+  // What to print under a button. A chord with even one unreachable key gets
+  // nothing: half a shortcut is worse than none, since it would read as the
+  // whole of it.
+  function shortcutHint(keys) {
+    var parts = keys.map(shortcutOf);
+    if (parts.indexOf("") !== -1) return "";
+    return parts.map(keyLabel).join(" + ");
+  }
+
+  function applyKeyButtons(list) {
+    // Whatever was held on the outgoing ROM's buttons is gone with it; the
+    // machine has been reset under us, so there is nothing to release -- but
+    // the latch list must not go on pointing at buttons that no longer exist.
+    latched = [];
+    while (keyBar.firstChild) keyBar.removeChild(keyBar.firstChild);
+    keyBar.classList.toggle("on", !!(list && list.length));
+    if (!list) return;
+
+    list.forEach(function (b) {
+      var el = document.createElement("button");
+      el.type = "button";
+
+      var name = document.createElement("span");
+      name.textContent = b.label;
+      el.appendChild(name);
+
+      // The keyboard is the only way to hold several of these at once -- a
+      // pointer can press one button at a time -- so every button says which
+      // key it stands for.
+      var hint = shortcutHint(b.keys);
+      if (hint) {
+        var sc = document.createElement("span");
+        sc.className = "sc";
+        sc.textContent = hint;
+        el.appendChild(sc);
+        el.title = b.label + " \u2014 " + hint;
+      } else {
+        el.title = b.label;
+      }
+
+      var down = false, at = 0;
+
+      function press() {
+        if (down || !api || drop.classList.contains("on")) return;
+        down = true;
+        at = frameNo;
+        b.keys.forEach(keyDown);
+      }
+
+      function release() {
+        if (!down) return;
+        down = false;
+        // The same minimum press the screen tap uses, and for the same
+        // reason: the firmware scans the matrix a little under once per
+        // frame, so a quick click can fall between two scans and be missed.
+        var wait = TAP_MIN_FRAMES - (frameNo - at);
+        if (wait > 0) pendingUp.push({ at: frameNo + wait, keys: b.keys });
+        else b.keys.forEach(keyUp);
+
+        // This was the key a latched modifier was waiting for. It goes after
+        // the release above so the chord is whole while it lasts.
+        releaseLatched();
+      }
+
+      function isLatched() {
+        for (var i = 0; i < latched.length; i++)
+          if (latched[i].el === el) return i;
+        return -1;
+      }
+
+      function toggleLatch() {
+        if (!api || drop.classList.contains("on")) return;
+        var i = isLatched();
+        if (i !== -1) {
+          latched.splice(i, 1);
+          b.keys.forEach(keyUp);
+          el.classList.remove("held");
+        } else {
+          b.keys.forEach(keyDown);
+          latched.push({ el: el, keys: b.keys });
+          el.classList.add("held");
+        }
+      }
+
+      if (b.sticky) {
+        // Held from the click until the next key has been pressed and let go,
+        // or until it is clicked again. Nothing else to release on pointerup:
+        // that is the whole point of it.
+        el.addEventListener("pointerdown", function (e) {
+          e.preventDefault();
+          window.focus();
+          toggleLatch();
+        });
+        el.addEventListener("click", function (e) {
+          if (e.detail === 0) toggleLatch();   // Space or Enter on the button
+        });
+      } else {
+        el.addEventListener("pointerdown", function (e) {
+          // Keeps the focus where the keyboard needs it, and stops the button
+          // from also reading as a tap on the screen.
+          e.preventDefault();
+          window.focus();
+          press();
+        });
+        ["pointerup", "pointercancel", "pointerleave"].forEach(function (t) {
+          el.addEventListener(t, release);
+        });
+
+        // Space or Enter on a focused button: a click with no pointer behind
+        // it, so there is no release to wait for and the press is momentary.
+        el.addEventListener("click", function (e) {
+          if (e.detail !== 0 || !api || drop.classList.contains("on")) return;
+          b.keys.forEach(keyDown);
+          pendingUp.push({ at: frameNo + TAP_MIN_FRAMES, keys: b.keys });
+          releaseLatched();
+        });
+      }
+
+      keyBar.appendChild(el);
+    });
+  }
   window.addEventListener("contextmenu", function (e) { e.preventDefault(); });
 
   // Capture, so this sees the gesture whatever else does with it.

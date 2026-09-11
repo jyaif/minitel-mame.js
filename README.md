@@ -10,7 +10,12 @@ Emscripten is needed for the build.
 ```sh
 make            # build web/minitel.js + web/minitel.wasm
 make serve      # build and serve web/ on http://localhost:8000
+make serve-docs # refresh docs/ and serve it on http://localhost:8001
 ```
+
+`serve` is the page you are editing; `serve-docs` is the published one, which
+keeps its own `config.js` and its own ROMs. They use different ports so both
+can run at once.
 
 Drop a `.bin` onto the page, or put the ROM next to `index.html` as `rom.bin`
 and it loads automatically.
@@ -32,6 +37,7 @@ It is MAME's `minitel2` driver, reduced to the parts the machine actually uses.
 | Thomson TS9347 video controller | `src/devices/video/ef9345.cpp` |
 | 24C02 I²C EEPROM | `src/devices/machine/i2cmem.cpp` |
 | Keyboard matrix, address decoding, timing, sound | `src/mame/philips/minitel_2_rpic.cpp` |
+| Rear serial port (prise péri-informatique) | `src/mame/philips/minitel_2_rpic.cpp` + `bus/rs232/` |
 
 Sound is the modem's monitor output, which is the only thing on this machine
 wired to a speaker: the TS7514 line interface can route what it is sending to
@@ -39,6 +45,14 @@ it, and the firmware uses that for dialling tones and the call-progress beep. A
 program that drives the chip itself gets a sixteen-tone DTMF generator out of
 it. The page plays what the core produces at the mixer's own sample rate, so
 nothing is resampled on the way out.
+
+The rear serial port is the 80C32's own UART on P3.0 and P3.1, and the CPU core
+already shifts the bits: what MAME gets from an `rs232_port_device` on that
+socket, this build open-codes as a line discipline — 1200 baud, seven data
+bits, even parity, one stop bit, the figures MAME's driver declares and the
+ones a Bv4 ROM reports when you ask it. Point `config.js` at a websocket and
+that becomes the other end of the cable, which is what lets a videotex service
+be dialled up from a browser.
 
 ## Layout
 
@@ -64,7 +78,8 @@ tools/
 
 `web/config.js` holds the front-end settings: which ROMs the page offers, the
 display shortcut, the video rate, how loud the speaker is, the colour of the
-moulding, and what tapping the screen sends:
+moulding, what tapping the screen sends, and what is plugged into the rear
+serial port:
 
 ```js
 window.MINITEL_CONFIG = {
@@ -74,7 +89,9 @@ window.MINITEL_CONFIG = {
   refreshHz:  50,                       // 60 is MAME's value; default 50
   volume:     0.35,                     // 0 to 1; 0 switches sound off
   bezelColor: "#121215",              // "#rgb" or "#rrggbb"
-  tapKeys:    ["Space", "ArrowUp"]      // [] for no touch input
+  tapKeys:    ["Space", "ArrowUp"],     // [] for no touch input
+  keyButtons: ["Sommaire"],             // default; per-ROM below
+  serial:     "wss://3615co.de/ws"      // default; per-ROM below
 };
 ```
 
@@ -86,6 +103,102 @@ top right corner, starting on the first entry and afterwards on whichever the
 visitor last chose. Each ROM keeps its own 24C02 EEPROM, so two roms do not
 overwrite each other's saved state, and a ROM dropped onto the page still runs
 whatever is listed.
+
+`serial` plugs a websocket into the prise péri-informatique. The socket carried
+a byte stream, and a videotex service reached over a websocket is that same
+byte stream with a different cable, so the page is only ever a wire: what
+arrives is shifted into the machine bit by bit at 1200 baud, and what the
+machine transmits is sent back.
+
+The socket belongs to a ROM rather than to the page, because a game wants
+nothing plugged in and a terminal ROM wants a service, so it goes on the `roms`
+entry:
+
+```js
+roms: [
+  { name: "Dino",      file: "dino.bin" },
+  { name: "Minitel 2", file: "minitel2_bv4.bin", serial: "wss://3615co.de/ws" }
+]
+```
+
+Switching ROMs unplugs one socket and plugs in the other, with the machine
+reset in between, so no byte of one ROM's traffic reaches the next. A top-level
+`serial` is only the default for entries that name none of their own, and an
+entry can say `serial: null` to opt out of it; a ROM with neither has nothing
+plugged in, which is what MAME does. Either form can be an object that sets the
+line as well, for a service or a firmware that does not use what the Minitel 2
+comes up with:
+
+```js
+serial: {
+  url:      "wss://3615co.de/ws",
+  baud:     1200,      // 50 to 4800
+  databits: 7,         // 7 or 8
+  parity:   "even",    // "none", "odd" or "even"
+  stopbits: 1          // 1 or 2
+}
+```
+
+`keyButtons` puts buttons along the bottom of the picture for combinations a
+browser cannot deliver. Some of what the Minitel's keyboard does is a chord —
+Fonction held with a letter, which is how the socket speed and the display are
+set — and a browser either swallows the combination as its own shortcut or has
+no key standing for Fonction at all. Each button holds its whole chord down for
+as long as it is pressed:
+
+```js
+keyButtons: [
+  "Sommaire",                                          // one key
+  { label: "Cnx/Fin",  keys: "Connexion" },
+  { label: "Fnct+P",   keys: ["Fonction", "KeyP"] },   // a chord
+  { label: "1200 bds", keys: ["Fonction", "KeyP", "Digit1"] }
+]
+```
+
+Key names are the ones used everywhere else: a `KeyboardEvent.code` such as
+`"KeyP"`, or a label printed on the Minitel's own keys. Without a `label` the
+key names are shown.
+
+A button may set `sticky: true`, which makes it latch: it stays down when
+clicked and releases after the next key has been pressed and let go, or when
+clicked again. That is what a modifier needs — Fonction is only useful held
+while another key is pressed, and a pointer cannot hold one button and press
+another:
+
+```js
+{ label: "Fonction", keys: "Fonction", sticky: true }
+```
+
+Each button also prints the key on your own keyboard that it stands for —
+Sommaire says `F7`, Fonction says `Right Alt` — because a pointer can press
+only one button at a time, and the keyboard is the only way to hold two of
+these down at once. (Holding a button with the mouse while typing works too.)
+The hint is derived from the same map the page reads key events through, so it
+cannot advertise a key that does not act; a chord with even one unreachable key
+prints nothing rather than half of itself. On a Mac the function keys may need
+Fn held, unless the keyboard is set to use F1, F2 as standard function keys.
+
+Like the socket, buttons belong to a ROM rather than to the page — the keys
+worth a button on a terminal ROM are not a game's — so they go on the `roms`
+entry, and switching ROMs swaps the row:
+
+```js
+roms: [
+  { name: "Dino", file: "dino.bin" },                  // no buttons
+  { name: "Minitel 2", file: "minitel2_bv4.bin",
+    keyButtons: [{ label: "Marche/Arrêt", keys: "MarcheArret" }] }
+]
+```
+
+A top-level `keyButtons` is only the default for entries that carry none of
+their own, and an entry can say `keyButtons: []` to opt out. With neither,
+there are no buttons — which is what the published page does for its three
+games and not for the firmware.
+
+Two things to know. A page served over https can only open a `wss://` URL — a
+plaintext `ws://` is blocked as mixed content, and silently, so the service
+merely looks down. And the machine comes up in standby: press **F10**
+(Marche/Arrêt) to turn the tube on, as you would on the real thing.
 
 `displayKey` steps through six display modes, stripping the presentation away a
 layer at a time — `bezel`, `tube`, `flat`, each also with a `-color` variant.
