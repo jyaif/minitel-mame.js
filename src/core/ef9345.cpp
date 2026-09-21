@@ -93,7 +93,57 @@ void ts9347_device::reset()
 
 	m_screen_out.fill(0);
 
+	for (u16 y = 0; y < TEXT_ROWS; y++)
+		text_clear_row(y);
+
 	set_video_mode();
+}
+
+//-------------------------------------------------
+//  text
+//-------------------------------------------------
+
+// Which part of a zoomed character a cell shows, from get_dial()'s code and
+// with the masks zoom() reads it with: 1, 2, 4 and 8 are the quarters of a
+// double-size character, 3 and 12 the halves of a double-height one, 5 and 10
+// the halves of a double-width one.
+u8 ts9347_device::dial_zoom(u8 dial)
+{
+	if (dial == 0)
+		return 0;
+
+	bool const left   = (dial & 0x0a) == 0;
+	bool const right  = (dial & 0x05) == 0;
+	bool const top    = (dial & 0x0c) == 0;
+	bool const bottom = (dial & 0x03) == 0;
+
+	return ((left || right) ? 0x10 : 0) | ((top || bottom) ? 0x20 : 0) |
+	       (right ? 0x40 : 0) | (bottom ? 0x80 : 0);
+}
+
+void ts9347_device::text_record(u16 x, u16 y, u8 code, u8 set, u8 zoom, u8 c0, u8 c1, u8 flags)
+{
+	if (x >= TEXT_STRIDE || y >= TEXT_ROWS)
+		return;
+
+	u8 *const cell = m_text[y][x];
+	cell[0] = code & 0x7f;
+	cell[1] = (set & 0x0f) | (zoom & 0xf0);
+	cell[2] = (c1 & 0x07) | ((c0 & 0x07) << 4);
+	cell[3] = flags;
+}
+
+// A space, which is code 0x20 of the alphanumerics: a zeroed cell would read
+// as code 0, the tilde.
+void ts9347_device::text_clear(u16 x, u16 y)
+{
+	text_record(x, y, 0x20, 0, 0, 0, 0, 0);
+}
+
+void ts9347_device::text_clear_row(u16 y)
+{
+	for (u16 x = 0; x < TEXT_STRIDE; x++)
+		text_clear(x, y);
 }
 
 //-------------------------------------------------
@@ -385,6 +435,17 @@ void ts9347_device::bichrome40(u8 type, u16 address, u8 dial, u16 iblock, u16 x,
 		iblock++;
 	bool cursor = iblock == 0x40 * i + (m_registers[7] & 0x3f);
 
+	// The cell as text, with the attributes it was given rather than the
+	// colours makecolors() is about to turn them into. address is the glyph's
+	// offset in its set, which spreads the code's bits out: this gathers them
+	// back up.
+	u8 zoom_bits = dial_zoom(dial);
+	if (m_mat & 0x80 && y > 0)
+		zoom_bits |= (y & 0x01) ? 0x20 : 0xa0;  // the whole screen doubled; see below
+	text_record(x, y, u8((((address >> 6) & 0x1f) << 2) | (address & 0x03)), type, zoom_bits, c0, c1,
+		(flash ? 0x01 : 0) | (conceal ? 0x02 : 0) | (negative ? 0x04 : 0) | (underline ? 0x08 : 0) |
+		((cursor && (m_mat & 0x40)) ? 0x10 : 0) | (insert ? 0x20 : 0));
+
 	bool cursor_underline;
 	std::tie(c0, c1, cursor_underline) = makecolors(c0, c1, insert, flash, conceal, negative, cursor);
 	if ((type & 7) != 2 && (type & 7) != 3) // no underline cursor if semi-gr.
@@ -441,6 +502,10 @@ void ts9347_device::bichrome80(u8 c, u8 a, u16 x, u16 y, bool cursor)
 	bool underline = BIT(a, 1);
 	bool flash = BIT(a, 2);
 	bool negative = BIT(a, 3);
+
+	text_record(x, y, c & 0x7f, index, 0, c0, c1,
+		(flash ? 0x01 : 0) | (negative ? 0x04 : 0) | (underline ? 0x08 : 0) |
+		((cursor && (m_mat & 0x40)) ? 0x10 : 0) | (insert ? 0x20 : 0));
 
 	bool cursor_underline;
 	std::tie(c0, c1, cursor_underline) = makecolors(c0, c1, insert, flash, false, negative, cursor);
@@ -511,6 +576,11 @@ void ts9347_device::makechar_16x40(u16 x, u16 y)
 	const u8 u = m_latchu;                     //underline
 
 	bichrome40(type, address, dial, iblock, x, y, c0, c1, i, f, m, n, u);
+
+	// A delimiter is drawn as character 127 in the colours it sets up, which
+	// on the screen is a space: that is what it is as text, too.
+	if ((b & 0xe0) == 0x80 && y < TEXT_ROWS)
+		m_text[y][x][0] = 0x20;
 }
 
 // generate 24 bits 40 columns char
@@ -537,7 +607,10 @@ void ts9347_device::makechar_24x40(u16 x, u16 y)
 	const u8 a = vram_r(m_block + ablock + 0x1000);
 
 	if ((b & 0xc0) == 0xc0)
+	{
+		text_clear(x, y);
 		return;         // quadrichrome, which the TS9347 does not support
+	}
 
 	const u8 dial = get_dial(x, bitswap<2>(b, 1, 3));
 
@@ -599,6 +672,10 @@ void ts9347_device::makechar(u16 x, u16 y)
 		case char_mode_t::MODEVAR40:
 		case char_mode_t::MODE8x80:
 			logerror("Unemulated EF9345 mode: %02x\n", u8(m_char_mode));
+			// Nothing is drawn, so nothing is there to read. Both cells, since
+			// one of these is an 80-column mode.
+			text_clear(2 * x, y);
+			text_clear(2 * x + 1, y);
 			break;
 		case char_mode_t::MODE12x80:
 			makechar_12x80(x, y);
@@ -924,6 +1001,7 @@ void ts9347_device::update_scanline(u16 scanline)
 		{
 			for (u16 i = 0; i < 42; i++)
 				draw_char_40(m_border, i, 1);
+			text_clear_row(0);
 		}
 	}
 	else if (scanline < 120)
@@ -937,6 +1015,7 @@ void ts9347_device::update_scanline(u16 scanline)
 		else
 		{
 			draw_border(scanline / 10);
+			text_clear_row(scanline / 10);
 		}
 	}
 	else if (scanline < 250)

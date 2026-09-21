@@ -31,7 +31,9 @@ EXPORTS := _mt_init,_mt_reset,_mt_rom_buffer,_mt_rom_buffer_size,_mt_load_rom, \
            _mt_serial_databits,_mt_serial_parity,_mt_serial_stopbits, \
            _mt_serial_in_buffer,_mt_serial_in_buffer_size,_mt_serial_write, \
            _mt_serial_out_buffer,_mt_serial_out_buffer_size,_mt_serial_read, \
-           _mt_serial_pending,_mt_serial_errors
+           _mt_serial_pending,_mt_serial_errors, \
+           _mt_text_cells,_mt_text_columns,_mt_memory,_mt_memory_size, \
+           _mt_sfr_peek,_mt_pc
 EXPORTS := $(subst $(subst ,, ),,$(EXPORTS))
 
 CXXFLAGS := -std=c++17 -Isrc/core -Ibuild -Wall

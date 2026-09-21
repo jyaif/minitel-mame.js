@@ -67,11 +67,14 @@ src/core/       the emulator
 src/wasm/
   api.cpp         the C entry points the page calls
 src/ts9347.bin    the character generator ROM, compiled into the module
-web/              the page: WebGL CRT renderer, sound, keyboard, ROM, EEPROM
+web/              the page: WebGL CRT renderer, sound, keyboard, ROM, EEPROM,
+                  remote control
   config.js       the ROMs on offer, display shortcut, video rate, volume,
                   bezel colour, touch keys
 tools/
   mkcharset.py    turn ts9347.bin into charset_rom.h, run by the Makefile
+  minitel_bridge.py  relay between the page's control socket and TCP
+  minitel_client.py  Python client for it, and a command line
 ```
 
 ### Configuring it
@@ -89,6 +92,7 @@ window.MINITEL_CONFIG = {
   refreshHz:  50,                       // 60 is MAME's value; default 50
   volume:     0.35,                     // 0 to 1; 0 switches sound off
   bezelColor: "#121215",              // "#rgb" or "#rrggbb"
+  control:    true,                     // remote control; off by default
   tapKeys:    ["Space", "ArrowUp"],     // [] for no touch input
   keyButtons: ["Sommaire"],             // default; per-ROM below
   serial:     "wss://3615co.de/ws"      // default; per-ROM below
@@ -219,6 +223,110 @@ keys :`Suite`, `Retour`, `Envoi`, `Repetition`, `Tel`, `Guide`, `Sommaire`,
 and any field in it, may be missing; the defaults above then apply. An unknown
 name, or a shortcut that is also a Minitel key and would therefore swallow it,
 is reported on the console.
+
+## Remote control
+
+A program on your own computer can drive the emulator: press keys, run it a
+frame at a time, read the screen as text, take screenshots, read and patch
+memory, load ROMs. A web page can only ever be the client of a websocket, so
+the page connects out to a small bridge, and programs talk to the bridge over
+plain TCP, one JSON object per line.
+
+```sh
+python3 tools/minitel_bridge.py         # the page connects to :8765, programs to :8766
+make serve                              # then open http://localhost:8000/?control
+python3 tools/minitel_client.py screen  # or press, type, step, screenshot, read...
+```
+
+Both tools are standard-library Python, so there is nothing to install. Remote
+control is off unless the page's URL asks for it: `?control` uses the bridge's
+default port, and `?control=PORT` or `?control=ws://127.0.0.1:PORT` another.
+From the query string only a websocket on this machine is accepted, so a link
+cannot point your tab at someone else's server; `control:` in `config.js` may
+name any URL, or `true` for the default. A badge in the bottom left corner is up
+while a program is connected, and if the bridge goes away the page resumes and
+lets go of any keys it was holding.
+
+The published page takes `?control` too, once `make pages` has put this
+version there. Chrome first asks whether the site may reach services on this
+computer; a browser that refuses a plaintext `ws://` from an https page can use
+`make serve` instead. The bridge accepts pages served from this machine and from
+the project's GitHub Pages site — `--origin` adds others — so some other site
+open in the same browser cannot connect in the emulator's place.
+
+From Python:
+
+```python
+import sys; sys.path.insert(0, "tools")
+from minitel_client import Minitel
+
+with Minitel() as m:
+    m.load_rom("docs/minitel2_bv4.bin")   # resets into it, with a blank EEPROM
+    m.pause()                             # from here on, time passes only when asked
+    m.step(25)                            # the firmware ignores keys as it starts
+    m.press("MarcheArret", frames=10)     # it comes up in standby
+    m.wait_for_text("REPERTOIRE")
+    print(m.screen_text())
+    m.screenshot("repertoire.png")
+```
+
+**Time** is counted in emulated frames, fifty to the second. A paused machine
+runs only when a command needs frames to pass — `step`, `wait`, `press`,
+`type` — and then as fast as it can, so a script that pauses first runs faster
+than real time and gets the same screens and memory every run. Pausing does not
+cut short a press that is under way. A machine running on its own keeps going
+when the page is hidden or its window covered, which would otherwise stop it.
+
+**The protocol.** A request is `{"id": 1, "cmd": "step", "frames": 10}` and its
+reply `{"id": 1, "ok": true, "frame": 1234}`, or `"ok": false` with an
+`"error"`. A command that takes time replies when it is done. `nc 127.0.0.1 8766`
+is enough to try it.
+
+| Command | Arguments (default) | Reply |
+| --- | --- | --- |
+| `info` | | `frame`, `paused`, `rom`, `refresh_hz`, `width`, `height`, `color`, `hidden`, `version` |
+| `pause`, `resume` | | `frame` |
+| `step` | `frames` (1) | `frame`; pauses, then runs exactly that many |
+| `wait` | `frames` (1) | `frame`; lets that many pass, paused or not |
+| `press` | `keys`, `frames` (4), `after` (4) | `frame`; holds the keys for `frames`, lets go, waits `after` |
+| `key_down`, `key_up` | `keys` | `frame` |
+| `release_all` | | `frame` |
+| `type` | `text`, `frames` (4), `after` (4) | `frame`; a `press` per character |
+| `screen` | `cells` (false) | `lines`, `text`, `cursor`, `cols`, `rows`, `frame`, and `cells` if asked |
+| `screenshot` | `format` (`"png"`) | `base64`, `width`, `height`, `format`, `color`, `frame` |
+| `read` | `space`, `addr`, `len` (to the end) | `hex` |
+| `write` | `space`, `addr`, `hex` | `len` |
+| `cpu` | | `pc`, `a`, `b`, `psw`, `sp`, `dptr`, `bank`, `r` (r0–r7) |
+| `reset` | | `frame`; the EEPROM survives, as it would |
+| `load_rom` | `base64`, `name`, `eeprom` | `frame`, `name`, `size` |
+
+Keys are named as in `config.js`, and `keys` is one name or a list pressed
+together. `type` covers letters, digits, space, newline and the punctuation on
+the Minitel's keys; letters go without Shift and come out in whatever case the
+terminal is in — capitals, on a Minitel just switched on.
+
+`screen` reads what the video chip last drew, cell by cell. `lines` is the grid,
+25 rows of 40 or 80, with the rest of a double-size character left blank; `text`
+is the same rows with that rest left out, which is how they read — `Hello`
+rather than `H e l l o` — and `wait_for_text` searches both. Mosaics come out
+as Unicode sextants, and characters the program has redefined as the letter
+with the same code. With `cells`, each cell also gives its `code`, its `set`
+(0 and 1 the alphanumerics, 2 the mosaics, 3 the 80-column extras, 8 and up
+redefined), `fg` and `bg` colours, and `attrs` from `wide`, `tall`, `right`,
+`bottom`, `flash`, `conceal`, `negative`, `underline`, `cursor` and `insert`.
+
+`screenshot` is the picture as the core draws it, without tube or bezel, in
+whichever of monochrome and colour the page is showing; `"rgba"` gives the raw
+pixels rather than a PNG.
+
+The memory spaces are `iram`, the 80C32's 256 bytes of internal RAM, which is
+all the RAM it has; `sfr`, its special function registers at 0x80–0xFF, read
+only and read without side effects, the ports as their latches; `vram`, the
+TS9347's 16K; `eeprom`, the 24C02; and `rom`, the image as loaded.
+
+`load_rom` takes the menu slot a dropped file uses and resets into the ROM. Its
+EEPROM starts blank, or as `eeprom` gives it, and is never saved in the
+browser, so every run starts from the same place.
 
 ## Licence
 

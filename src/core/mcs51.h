@@ -54,6 +54,13 @@ public:
 
 	u16 pc() const { return m_pc; }
 
+	// For a debugger: the internal RAM, and an SFR's value read without the
+	// side effects a MOV from it would have. The ports read back as their
+	// latches rather than their pins.
+	static constexpr int INTERNAL_RAM_SIZE = 0x100;
+	u8 *internal_ram() { return m_internal_ram; }
+	u8 sfr_peek(u8 r) const;
+
 	// At least CMOS devices may be forced to read from ports configured as
 	// output. All you need is a low impedance output connected to the port.
 	void set_port_forced_input(u8 port, u8 forced_input) { m_forced_inputs[port] = forced_input; }

@@ -141,6 +141,29 @@ public:
 	u8 *nvram() { return m_i2cmem.data(); }
 	static constexpr std::size_t NVRAM_SIZE = i2c_24c02_device::DATA_SIZE;
 
+	// DEBUGGING
+	//
+	// The rest of the machine's memory, for a host that wants to inspect or
+	// patch a running program: the 80C32's internal RAM, which is all the RAM
+	// it has -- nothing but the keyboard and the video chip is decoded in its
+	// external data space -- the video chip's, and the ROM image, which
+	// mirrors to fill the 64K program space if it is shorter.
+	static constexpr std::size_t INTERNAL_RAM_SIZE = mcs51_cpu_device::INTERNAL_RAM_SIZE;
+	u8 *internal_ram() { return m_maincpu.internal_ram(); }
+
+	static constexpr std::size_t vram_size() { return ts9347_device::vram_size(); }
+	u8 *vram() { return m_ts9347.vram(); }
+
+	u8 *cart() { return m_cart; }
+	std::size_t cart_size() const { return m_cart_size; }
+
+	u16 pc() const { return m_maincpu.pc(); }
+	u8 sfr_peek(u8 r) const { return m_maincpu.sfr_peek(r); }
+
+	// The screen as character cells; see ts9347_device::text_cells().
+	const u8 *text_cells() const { return m_ts9347.text_cells(); }
+	int text_columns() const { return m_ts9347.text_columns(); }
+
 	// PERI-INFORMATIQUE
 	//
 	// The rear DIN socket, on the 80C32's own UART: P3.0 is RXD and P3.1 TXD,

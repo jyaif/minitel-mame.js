@@ -155,6 +155,15 @@ window.MINITEL_CONFIG = {
   //
   //   keyButtons: ["Sommaire"],
 
+  // Remote control: a websocket the page connects out to, so that a program
+  // on this computer can drive the machine -- press keys, step it a frame at
+  // a time, read the screen, load ROMs. tools/minitel_bridge.py is the other
+  // end, and the README lists what it can do. Off by default, and ?control in
+  // the page's URL turns it on for one visit without this; set it here to
+  // have it always on. true means the bridge's default address:
+  //
+  //   control: "ws://127.0.0.1:8765",
+
   // Keys sent while the screen is touched.
   tapKeys: ["Space", "ArrowUp"]
 };

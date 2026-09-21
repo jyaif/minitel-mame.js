@@ -99,6 +99,18 @@ u8 mcs51_cpu_device::sfr_read(u8 r)
 	}
 }
 
+u8 mcs51_cpu_device::sfr_peek(u8 r) const
+{
+	switch (r)
+	{
+		case 0x80: return m_p0;
+		case 0x90: return m_p1;
+		case 0xa0: return m_p2;
+		case 0xb0: return m_p3;
+		default:   return const_cast<mcs51_cpu_device *>(this)->sfr_read(r);
+	}
+}
+
 void mcs51_cpu_device::sfr_write(u8 r, u8 data)
 {
 	switch (r)

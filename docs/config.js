@@ -25,6 +25,8 @@ window.MINITEL_CONFIG = {
   //
   roms: [
     { name: "Dino",         file: "dino.bin" },
+    { name: "Raycast",         file: "raycast.bin" },
+    { name: "Volleyball",         file: "volleyball.bin" },
     { name: "Hello Modem",  file: "hello_modem.bin" },
     { name: "Demo Minitel", file: "demo_minitel.bin" },
 
@@ -58,6 +60,27 @@ window.MINITEL_CONFIG = {
       ] },
       { name: "Minitel 2 (BV4) - minitel.labbej.fr", file: "minitel2_bv4.bin",
       serial: "wss://minitel.labbej.fr:8182",
+      keyButtons: [
+        { label: "Marche/Arrêt", keys: "MarcheArret" },
+        { label: "Connexion/Fin", keys: "Connexion" },
+        { label: "Sommaire",     keys: "Sommaire" },
+        { label: "Guide",        keys: "Guide" },
+        { label: "Annulation",   keys: "Annulation" },
+        { label: "Correction",   keys: "Correction" },
+        { label: "Retour",       keys: "Retour" },
+        { label: "Répétition",   keys: "Repetition" },
+        { label: "Suite",        keys: "Suite" },
+        { label: "Envoi",        keys: "Envoi" },
+        { label: "Tel",          keys: "Tel" },
+
+        // Fonction is a modifier: it is only ever useful held down while
+        // something else is pressed, and a pointer cannot hold one button and
+        // press another. So it latches -- click it, it stays down, and the
+        // next key you press on the keyboard or on this row goes with it.
+        { label: "Fonction",     keys: "Fonction", sticky: true }
+      ] },
+        { name: "Minitel 2 (BV4) - minibix", file: "minitel2_bv4.bin",
+      serial: "wss://minibix.217.160.162.247.nip.io:8182",
       keyButtons: [
         { label: "Marche/Arrêt", keys: "MarcheArret" },
         { label: "Connexion/Fin", keys: "Connexion" },

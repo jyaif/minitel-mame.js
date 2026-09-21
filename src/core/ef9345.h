@@ -88,6 +88,37 @@ public:
 	// palette, filled in by the machine (8 grey levels + 1 spare)
 	rgb_t m_pen[9] = { };
 
+	// TEXT
+	//
+	// What each character cell showed when it was last drawn, for a host that
+	// wants the screen as text rather than as pixels. It is recorded as the
+	// rows are rendered, so it follows every mode, latch and zoom the picture
+	// does with no second decoder to keep in step. Rows are TEXT_STRIDE cells
+	// apart whatever the mode; text_columns() says how many of them are in use.
+	// Four bytes a cell:
+	//
+	//   [0] character code, 7 bits
+	//   [1] bits 0-3 the character set as read_char() indexes it: 0 and 1 the
+	//       alphanumerics, 2 the mosaics, 3 the 80-column extras, 8 and up
+	//       characters redefined in video RAM. Bit 4 double width, bit 5
+	//       double height, bit 6 the right half of a double-width character,
+	//       bit 7 the lower half of a double-height one.
+	//   [2] foreground colour in bits 0-2, background in bits 4-6
+	//   [3] bit 0 flash, 1 conceal, 2 negative, 3 underline, 4 the cursor is
+	//       on this cell and showing, 5 insert
+	//
+	// A row the chip shows as border reads as spaces.
+	static constexpr int TEXT_ROWS = 25;
+	static constexpr int TEXT_STRIDE = 80;
+
+	const u8 *text_cells() const { return &m_text[0][0][0]; }
+	int text_columns() const { return (m_char_mode == char_mode_t::MODE12x80 || m_char_mode == char_mode_t::MODE8x80) ? 80 : 40; }
+
+	// The video RAM, which a program is free to use as working memory as well
+	// as for the page it shows.
+	u8 *vram() { return m_vram; }
+	static constexpr std::size_t vram_size() { return VRAM_SIZE; }
+
 private:
 	enum class char_mode_t : u8 {
 		// 40 column modes:
@@ -138,6 +169,14 @@ private:
 	void draw_char_40(u8 *c, u16 x, u16 y);
 	void draw_char_80(u8 *c, u16 x, u16 y);
 	void draw_border(u16 line);
+
+	// Keep m_text up to date: one cell as it is drawn, or a cell or a whole row
+	// that is showing nothing. zoom is byte [1]'s top four bits, which
+	// dial_zoom() works out from get_dial()'s answer.
+	void text_record(u16 x, u16 y, u8 code, u8 set, u8 zoom, u8 c0, u8 c1, u8 flags);
+	void text_clear(u16 x, u16 y);
+	void text_clear_row(u16 y);
+	static u8 dial_zoom(u8 dial);
 
 	void ef9345_exec(u8 cmd);
 
@@ -191,6 +230,8 @@ private:
 	u8 m_latchu = 0;                      // underline attribute latch
 
 	bitmap_rgb32 m_screen_out;
+
+	u8 m_text[TEXT_ROWS][TEXT_STRIDE][4] = { };  // see text_cells()
 };
 
 #endif // MINITEL_EF9345_H

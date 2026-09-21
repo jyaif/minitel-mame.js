@@ -127,6 +127,26 @@
   }
   #keys button.held .sc { opacity: .85; }
   #keys button:active { background: #4a3c2c; color: #fff; }
+
+  /* Up while a program is driving the machine through the control socket, so
+     nobody is left wondering why the game is playing itself -- or has
+     stopped. A notice rather than a control, so the pointer goes through it. */
+  #remote {
+    position: fixed;
+    left: 12px;
+    bottom: 10px;
+    z-index: 1;
+    display: none;
+    padding: 5px 8px;
+    border: 1px solid #4a3c2c;
+    border-radius: 8px;
+    background: #000a;
+    color: #d8cbb4;
+    font: 12px/1.2 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    opacity: .6;
+    pointer-events: none;
+  }
+  #remote.on { display: block; }
 </style>
 </head>
 <body>
@@ -144,6 +164,7 @@
 <!-- After #drop, so it stays reachable while the drop panel is up. -->
 <select id="roms" aria-label="ROM"></select>
 <div id="keys"></div>
+<div id="remote"></div>
 
 <script src="config.js"></script>
 <script src="minitel.js"></script>
@@ -446,6 +467,39 @@
     } catch (e) { /* storage unavailable: start where config.js says */ }
   }
 
+  // The remote-control socket, which lets a program on the visitor's own
+  // computer drive the machine -- tools/minitel_bridge.py is the other end.
+  // Off unless asked for. ?control turns it on for this visit at the bridge's
+  // default port, and ?control=PORT or ?control=URL names another; but a link
+  // is something a stranger can send you, so what the query string names has
+  // to be on this machine, or their server could drive the emulator in your
+  // tab and read what is on its screen. config.js belongs to the site and may
+  // name any URL, or true for the default.
+  var CONTROL_DEFAULT = "ws://127.0.0.1:8765";
+
+  function parseControl() {
+    var m = /(?:^|[?&])control(?:=([^&]*))?(?:&|$)/.exec(location.search);
+    if (m) {
+      var v = m[1] || "";
+      try { v = decodeURIComponent(v); } catch (e) { }
+      var url = !v ? CONTROL_DEFAULT : /^\d+$/.test(v) ? "ws://127.0.0.1:" + v : v;
+      var u = null;
+      try { u = new URL(url); } catch (e) { }
+      if (!u || (u.protocol !== "ws:" && u.protocol !== "wss:")
+          || !/^(localhost|127(\.\d+){3}|\[::1\])$/.test(u.hostname)) {
+        warn("?control=" + v + " is not a websocket on this machine;"
+             + " remote control stays off");
+        return null;
+      }
+      return url;
+    }
+    var c = CFG.control;
+    if (c === undefined || c === null || c === false) return null;
+    return c === true ? CONTROL_DEFAULT : String(c);
+  }
+
+  var CONTROL_URL = parseControl();
+
   // Opening the page with ?fps shows what the pacing settled on: the machine's
   // speed against the wall clock, emulated frames per second, the display rate
   // it locked to, and what one emulated frame plus its blit actually costs.
@@ -517,7 +571,13 @@
       serialWrite: mod._mt_serial_write,
       serialOutBuffer: mod._mt_serial_out_buffer,
       serialRead: mod._mt_serial_read,
-      serialErrors: mod._mt_serial_errors
+      serialErrors: mod._mt_serial_errors,
+      textCells: mod._mt_text_cells,
+      textColumns: mod._mt_text_columns,
+      memory: mod._mt_memory,
+      memorySize: mod._mt_memory_size,
+      sfrPeek: mod._mt_sfr_peek,
+      pc: mod._mt_pc
     };
   }
 
@@ -534,7 +594,9 @@
     var max = api.romBufferSize();
     if (bytes.length > max) bytes = bytes.subarray(0, max);
     heap.set(bytes, api.romBuffer());
-    NVRAM_KEY = nvramKey(file);
+    // An ephemeral ROM keeps its EEPROM out of storage entirely: see
+    // useExtraRom().
+    NVRAM_KEY = rom.ephemeral ? null : nvramKey(file);
     api.loadRom(bytes.length);   // resets the machine, EEPROM and serial included
     restoreNvram();
 
@@ -619,23 +681,32 @@
     });
   }
 
-  // A dropped file is not one of the configured ROMs, but the menu is where a
-  // visitor looks to see what is running, so it takes a slot at the end of the
-  // list -- the same slot each time, for as long as the page is open.
+  // A ROM dropped on the page or sent over the control socket is not one of
+  // the configured ROMs, but the menu is where a visitor looks to see what is
+  // running, so it takes a slot at the end of the list -- the same slot each
+  // time, for as long as the page is open.
   var dropped = null;
+
+  // An ephemeral ROM's EEPROM is neither restored from this browser's storage
+  // nor saved to it, so a program driving the page starts from the same blank
+  // one every time rather than from whatever the last run left there.
+  function useExtraRom(name, bytes, ephemeral) {
+    if (!dropped) {
+      dropped = { name: "", file: "", bytes: null,
+                  serial: SERIAL_DEFAULT, keyButtons: KEY_BUTTONS_DEFAULT };
+      ROMS.push(dropped);
+      if (menu) addOption(dropped);
+    }
+    dropped.name = dropped.file = name;
+    dropped.bytes = bytes;
+    dropped.ephemeral = !!ephemeral;
+    if (menu) menu.options[ROMS.length - 1].textContent = dropped.name;
+    return selectRom(ROMS.length - 1);
+  }
 
   function useDroppedRom(f) {
     f.arrayBuffer().then(function (b) {
-      if (!dropped) {
-        dropped = { name: "", file: "", bytes: null,
-                    serial: SERIAL_DEFAULT, keyButtons: KEY_BUTTONS_DEFAULT };
-        ROMS.push(dropped);
-        if (menu) addOption(dropped);
-      }
-      dropped.name = dropped.file = f.name;
-      dropped.bytes = new Uint8Array(b);
-      if (menu) menu.options[ROMS.length - 1].textContent = dropped.name;
-      selectRom(ROMS.length - 1).catch(function () { });
+      useExtraRom(f.name, new Uint8Array(b), false).catch(function () { });
     });
   }
 
@@ -657,6 +728,7 @@
   // NVRAM (the 24C02 the Minitel keeps its settings in)
   // ---------------------------------------------------------------------
   function restoreNvram() {
+    if (!NVRAM_KEY) return;
     try {
       var saved = localStorage.getItem(NVRAM_KEY);
       if (!saved) return;
@@ -666,6 +738,7 @@
   }
 
   function saveNvram() {
+    if (!NVRAM_KEY) return;
     try {
       var ptr = api.nvram(), n = api.nvramSize();
       var s = "";
@@ -757,6 +830,13 @@
           var p = ctx.resume();
           if (p && p.catch) p.catch(function () { /* not allowed yet; the next gesture tries again */ });
         }
+      },
+
+      // Throw away what the machine made without playing it. A machine being
+      // stepped by a program runs faster or slower than real time, and what
+      // it sounds like then is not worth hearing.
+      drain: function () {
+        if (api) while (api.audioRead() > 0) { }
       },
 
       // Called once per animation frame, after the machine has run.
@@ -2012,18 +2092,25 @@
 
   var lastDraw = 0;
 
+  // One emulated frame, and whatever was waiting for it to pass.
+  function runOne() {
+    api.runFrame();
+    frameNo++;
+    while (pendingUp.length && pendingUp[0].at <= frameNo)
+      pendingUp.shift().keys.forEach(keyUp);
+    if (waiters.length) settleWaiters();
+  }
+
   function frame(now) {
     requestAnimationFrame(frame);
 
     var want = pacer.tick(now);
+    // Paused, the remote end says when the machine runs. Hidden, the hidden-
+    // page clock does (see createHiddenClock), and would run every frame twice.
+    if (paused || (hiddenClock && document.hidden)) want = 0;
     var t = fps ? performance.now() : 0;
 
-    for (var i = 0; i < want; i++) {
-      api.runFrame();
-      frameNo++;
-      while (pendingUp.length && pendingUp[0].at <= frameNo)
-        pendingUp.shift().keys.forEach(keyUp);
-    }
+    for (var i = 0; i < want; i++) runOne();
 
     audio.pump();
     if (serial) serial.pump();
@@ -2094,6 +2181,11 @@
   var pendingUp = [];     // releases waiting out the minimum press
   var frameNo = 0;
 
+  // Keys the remote end is holding, by the same "row,bit" name as held. They
+  // go through the same reference counts, so a key that it and the visitor
+  // both hold stays down until both have let go.
+  var ctlHeld = {};
+
   // Buttons that latch: a modifier like Fonction is only useful held while
   // something else is pressed, and a pointer cannot hold one button and press
   // another. So it stays down until the next key has been and gone, the way a
@@ -2131,6 +2223,14 @@
     latched.forEach(function (l) { l.el.classList.remove("held"); });
     latched = [];
     if (api) api.releaseAll();
+
+    // What the remote end holds is its own to let go of: a blur is the visitor
+    // switching windows, which says nothing about a program's keys.
+    for (var k in ctlHeld) {
+      if (!Object.prototype.hasOwnProperty.call(ctlHeld, k)) continue;
+      held[k] = 1;
+      if (api) api.setKey(ctlHeld[k][0], ctlHeld[k][1], 1);
+    }
   }
 
   window.addEventListener("keydown", function (e) {
@@ -2404,6 +2504,587 @@
 
   window.focus();
 
+  // =====================================================================
+  // Remote control
+  //
+  // A program on the visitor's machine drives the emulator through a
+  // websocket the page opens to tools/minitel_bridge.py, which passes it on
+  // to programs as JSON lines over TCP. A request is an object with a "cmd"
+  // and an "id"; its reply has the same "id", "ok", and either the result's
+  // fields or an "error". The README lists the commands.
+  //
+  // Time is the part that needs care. A script wants "hold this key for four
+  // frames, then read the screen" to mean exactly that whatever the browser is
+  // doing, so everything that takes time is counted in emulated frames rather
+  // than milliseconds, and the remote end can pause the machine and step it
+  // itself -- as fast as it will go, which is how a test runs faster than real
+  // time and gets the same answer every run.
+  // =====================================================================
+  var PROTOCOL_VERSION = 1;
+
+  var paused = false;
+  var stepTarget = 0;       // while paused, the frame to run up to
+  var waiters = [];         // { at, fn }: see afterFrames()
+  var hiddenClock = null;
+  var control = null;
+  var remoteBadge = document.getElementById("remote");
+
+  function own(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
+
+  function mergeInto(dst, src) {
+    for (var k in src) if (own(src, k)) dst[k] = src[k];
+    return dst;
+  }
+
+  // Call fn once n more frames have run. It is called synchronously between
+  // two frames, so that what it does lands on exactly that boundary however
+  // many frames the loop runs at a time -- a promise would only get round to
+  // it after the whole batch. A paused machine is stepped until it gets there:
+  // pausing stops the machine running on its own, not the work the remote end
+  // has asked of it.
+  function afterFrames(n, fn) {
+    var at = frameNo + n;
+    if (at <= frameNo) { fn(); return; }
+    waiters.push({ at: at, fn: fn });
+    if (paused && at > stepTarget) { stepTarget = at; kickStepper(); }
+  }
+
+  function settleWaiters() {
+    var due = [];
+    waiters = waiters.filter(function (w) {
+      if (w.at > frameNo) return true;
+      due.push(w);
+      return false;
+    });
+    due.forEach(function (w) { w.fn(); });
+  }
+
+  function advance(n) {
+    return new Promise(function (resolve) {
+      afterFrames(n, function () { resolve({ frame: frameNo }); });
+    });
+  }
+
+  function setPaused(on) {
+    paused = !!on;
+    if (paused) {
+      stepTarget = frameNo;
+      waiters.forEach(function (w) { if (w.at > stepTarget) stepTarget = w.at; });
+      kickStepper();
+    }
+    showBadge();
+  }
+
+  // Runs a paused machine up to stepTarget a slice at a time: as many frames
+  // as fit in a few milliseconds, then a yield, so that messages, drawing and
+  // the rest of the page get their turn. The yield is a MessageChannel rather
+  // than a timer, since a hidden page's timers are throttled to one a second.
+  var stepChannel = null, stepQueued = false;
+
+  function kickStepper() {
+    if (stepQueued || !paused || frameNo >= stepTarget) return;
+    if (!stepChannel) {
+      stepChannel = new MessageChannel();
+      stepChannel.port1.onmessage = stepSlice;
+    }
+    stepQueued = true;
+    stepChannel.port2.postMessage(0);
+  }
+
+  function stepSlice() {
+    stepQueued = false;
+    if (!paused || !running) return;
+    var t0 = performance.now(), ran = 0;
+    while (frameNo < stepTarget && performance.now() - t0 < 12) { runOne(); ran++; }
+    if (ran) {
+      audio.drain();
+      if (serial) serial.pump();
+      if (!document.hidden) draw(1000 / MACHINE_HZ);
+    }
+    kickStepper();
+  }
+
+  // A page nobody can see gets no animation frames, and its timers are held to
+  // one a second or less, which would stop a machine running on its own dead
+  // the moment its window was covered -- with a script left waiting on it. A
+  // worker's timers are not throttled, nor is the message it posts, so while
+  // the page is hidden a worker ticking at the machine's rate keeps it going.
+  // Only a page under remote control gets one: a visitor who cannot see the
+  // game does not need it to go on playing.
+  function createHiddenClock(hz) {
+    var src = "var t=null;onmessage=function(e){clearInterval(t);t=null;"
+            + "if(e.data)t=setInterval(function(){postMessage(0)}," + (1000 / hz) + ")}";
+    var w;
+    try {
+      w = new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+    } catch (e) {
+      warn("no clock for a hidden page: " + e);
+      return null;
+    }
+
+    var last = 0, acc = 0;
+    w.onmessage = function () {
+      var now = performance.now();
+      if (!document.hidden || paused || !running) { last = 0; return; }
+      acc += last ? (now - last) * hz / 1000 : 1;
+      last = now;
+      var n = 0;
+      while (acc >= 1 && n < 4) { acc -= 1; runOne(); n++; }
+      if (acc > 1) acc = 1;
+      if (n) { audio.pump(); if (serial) serial.pump(); }
+    };
+
+    function sync() { w.postMessage(document.hidden ? 1 : 0); }
+    document.addEventListener("visibilitychange", sync);
+    sync();
+    return w;
+  }
+
+  // ---- keys ----
+
+  function keyList(v) {
+    var names = Array.isArray(v) ? v : (v === undefined || v === null ? [] : [v]);
+    if (!names.length) throw new Error('no "keys" given');
+    return names.map(function (n) {
+      n = String(n);
+      var e = own(KEYMAP, n) ? KEYMAP[n] : own(MINITEL_KEYS, n) ? MINITEL_KEYS[n]
+            : own(FKEYS, n) ? FKEYS[n] : null;
+      if (!e) throw new Error('unknown key "' + n + '"');
+      return e;
+    });
+  }
+
+  function ctlDown(keys) {
+    keys.forEach(function (e) {
+      var k = e[0] + "," + e[1];
+      if (own(ctlHeld, k)) return;
+      ctlHeld[k] = e;
+      keyDown(e);
+    });
+  }
+
+  function ctlUp(keys) {
+    keys.forEach(function (e) {
+      var k = e[0] + "," + e[1];
+      if (!own(ctlHeld, k)) return;
+      delete ctlHeld[k];
+      keyUp(e);
+    });
+  }
+
+  function ctlReleaseAll() {
+    var all = [];
+    for (var k in ctlHeld) if (own(ctlHeld, k)) all.push(ctlHeld[k]);
+    ctlUp(all);
+  }
+
+  // What `type` can press besides letters and digits: the characters the
+  // Minitel's keys carry, as MAME's minitel2 driver labels them. Letters go
+  // without Shift whatever their case and come out in whatever case the
+  // terminal is in -- capitals, on a Minitel that has just been switched on.
+  var TYPE_KEYS = {
+    " ": ["Space"], "\n": ["Enter"], "\r": ["Enter"], "\b": ["Backspace"],
+    "-": ["BracketLeft"], ":": ["Semicolon"], "?": ["Slash"], ";": ["Quote"],
+    ".": ["Period"], ",": ["Comma"], "'": ["Backquote"],
+    "*": ["NumpadMultiply"], "#": ["NumpadAdd"],
+    "]": ["ShiftLeft", "Period"], "[": ["ShiftLeft", "Comma"]
+  };
+
+  function typeKeys(ch) {
+    if (own(TYPE_KEYS, ch)) return TYPE_KEYS[ch];
+    if (/^[a-z]$/i.test(ch)) return ["Key" + ch.toUpperCase()];
+    if (/^[0-9]$/.test(ch)) return ["Digit" + ch];
+    return null;
+  }
+
+  // ---- the screen as text ----
+
+  // The TS9347's character sets, read off its ROM glyph by glyph -- this is
+  // what the screen shows, whatever a datasheet says. Sets 0 and 1 are the
+  // same alphanumerics: ASCII from 0x20 with Videotex's arrow and rules, and
+  // below it the accented letters and symbols the Minitel reaches with SS2.
+  // Set 2 is the mosaics, 0x00-0x3f separated and 0x40-0x7f contiguous, the
+  // low six bits one per cell in the same order as Unicode's sextants. Set 3
+  // is the box drawing an 80-column row has above 0x80. Sets 8 and up are
+  // characters the program has redefined, which have no text of their own:
+  // they read as the alphanumeric with the same code, which is what a
+  // redefined font means and at least tells two tiles apart.
+  var G0 = "~§ü£â}äöùßŒ{←î→↓°±éëïçûà÷èœê¼½¾ô"
+         + " !\"#$%&'()*+,-./0123456789:;<=>?"
+         + "@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]↑_"
+         + "─abcdefghijklmnopqrstuvwxyz▏|▕▔█";
+  var G80 = " ┐┌└┬┼┤├┴▕Ä¤ÜÑñòì¿`Φ^Éµ≠╱╲┘";
+
+  function sextant(v) {
+    // Unicode leaves out the four sextants that were already block elements.
+    if (v === 0) return " ";
+    if (v === 21) return "▌";
+    if (v === 42) return "▐";
+    if (v === 63) return "█";
+    return String.fromCodePoint(0x1fb00 + v - 1 - (v > 21 ? 1 : 0) - (v > 42 ? 1 : 0));
+  }
+
+  function glyph(set, code) {
+    if (set === 2) return sextant(code & 0x3f);
+    if (set === 3) return code < G80.length ? G80.charAt(code) : " ";
+    return G0.charAt(code & 0x7f);
+  }
+
+  var TEXT_ROWS = 25, TEXT_STRIDE = 80;   // ts9347_device's, see ef9345.h
+
+  var CELL_ATTRS = [
+    [1, 0x10, "wide"], [1, 0x20, "tall"], [1, 0x40, "right"], [1, 0x80, "bottom"],
+    [3, 0x01, "flash"], [3, 0x02, "conceal"], [3, 0x04, "negative"],
+    [3, 0x08, "underline"], [3, 0x10, "cursor"], [3, 0x20, "insert"]
+  ];
+
+  // lines is the grid, a character to a cell, with each character at its top
+  // left and the rest of a double-size one blank. text is the same rows with
+  // that rest left out, which is how they read -- "Hello" rather than
+  // "H e l l o" -- and what to search.
+  function readScreen(withCells) {
+    var cols = api.textColumns(), base = api.textCells();
+    var lines = [], texts = [], cells = [], cursor = null;
+    for (var y = 0; y < TEXT_ROWS; y++) {
+      var line = "", text = "", row = [];
+      for (var x = 0; x < cols; x++) {
+        var o = base + (y * TEXT_STRIDE + x) * 4;
+        var code = heap[o], set = heap[o + 1] & 0x0f, ch = glyph(set, code);
+        if (heap[o + 1] & 0xc0) {
+          line += " ";
+        } else {
+          line += ch;
+          text += ch;
+        }
+        if (heap[o + 3] & 0x10) cursor = { x: x, y: y };
+        if (withCells) {
+          var attrs = [];
+          for (var i = 0; i < CELL_ATTRS.length; i++)
+            if (heap[o + CELL_ATTRS[i][0]] & CELL_ATTRS[i][1]) attrs.push(CELL_ATTRS[i][2]);
+          row.push({ ch: ch, code: code, set: set,
+                     fg: heap[o + 2] & 7, bg: (heap[o + 2] >> 4) & 7, attrs: attrs });
+        }
+      }
+      lines.push(line);
+      texts.push(text);
+      if (withCells) cells.push(row);
+    }
+    var out = { frame: frameNo, cols: cols, rows: TEXT_ROWS, lines: lines, text: texts,
+                cursor: cursor };
+    if (withCells) out.cells = cells;
+    return out;
+  }
+
+  // The picture as the core draws it -- no tube, no bezel -- in whichever of
+  // monochrome and colour the page is showing.
+  function screenshot(format) {
+    var w = api.width(), h = api.height(), at = api.rgba();
+    var px = heap.slice(at, at + w * h * 4);
+    var out = { frame: frameNo, width: w, height: h, format: format, color: !!colorOn };
+    if (format === "rgba") {
+      out.base64 = toBase64(px);
+      return out;
+    }
+    if (format !== "png") throw new Error('format must be "png" or "rgba"');
+    var c = document.createElement("canvas");
+    c.width = w;
+    c.height = h;
+    var ctx = c.getContext("2d");
+    var img = ctx.createImageData(w, h);
+    img.data.set(px);
+    ctx.putImageData(img, 0, 0);
+    var url = c.toDataURL("image/png");
+    out.base64 = url.slice(url.indexOf(",") + 1);
+    return out;
+  }
+
+  // ---- memory ----
+
+  // The memories by the numbers mt_memory() takes. sfr is apart: registers
+  // read one at a time through mt_sfr_peek(), at their own addresses.
+  var SPACES = { iram: 0, vram: 1, eeprom: 2, rom: 3 };
+
+  function memSpace(a) {
+    var name = String(a.space);
+    if (name === "sfr") return { name: name, lo: 0x80, hi: 0x100, at: null };
+    if (!own(SPACES, name))
+      throw new Error('unknown space "' + name + '"; expected sfr, '
+                      + Object.keys(SPACES).join(", "));
+    return { name: name, lo: 0, hi: api.memorySize(SPACES[name]), at: api.memory(SPACES[name]) };
+  }
+
+  function checkSpan(sp, addr, len) {
+    if (addr < sp.lo || addr + len > sp.hi)
+      throw new Error(sp.name + " runs from " + sp.lo + " to " + (sp.hi - 1)
+                      + "; " + len + " bytes at " + addr + " do not fit");
+  }
+
+  function count(v, dflt, what) {
+    if (v === undefined || v === null) return dflt;
+    var n = Number(v);
+    if (typeof v === "boolean" || v === "" || !isFinite(n) || Math.floor(n) !== n
+        || n < 0 || n > 1e9)
+      throw new Error(what + " must be a whole number, not " + JSON.stringify(v));
+    return n;
+  }
+
+  function toHex(bytes) {
+    var s = "";
+    for (var i = 0; i < bytes.length; i++) s += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+    return s;
+  }
+
+  function fromHex(s) {
+    if (typeof s !== "string" || !/^([0-9a-fA-F]{2})*$/.test(s))
+      throw new Error('"hex" must be a string of hex digit pairs');
+    var b = new Uint8Array(s.length / 2);
+    for (var i = 0; i < b.length; i++) b[i] = parseInt(s.substr(2 * i, 2), 16);
+    return b;
+  }
+
+  function toBase64(bytes) {
+    var s = "";
+    for (var i = 0; i < bytes.length; i += 0x8000)
+      s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(s);
+  }
+
+  function fromBase64(s, what) {
+    if (typeof s !== "string") throw new Error('"' + what + '" must be a base64 string');
+    try {
+      return Uint8Array.from(atob(s), function (c) { return c.charCodeAt(0); });
+    } catch (e) {
+      throw new Error('"' + what + '" is not valid base64');
+    }
+  }
+
+  // ---- commands ----
+
+  var COMMANDS = {
+    info: function () {
+      return {
+        version: PROTOCOL_VERSION,
+        frame: frameNo,
+        paused: paused,
+        rom: running ? ROMS[romIndex].name : null,
+        refresh_hz: MACHINE_HZ,
+        width: api.width(),
+        height: api.height(),
+        color: !!colorOn,
+        hidden: !!document.hidden
+      };
+    },
+
+    pause: function () { setPaused(true); return { frame: frameNo }; },
+    resume: function () { setPaused(false); return { frame: frameNo }; },
+
+    // Pause, then run exactly this many frames.
+    step: function (a) {
+      var n = count(a.frames, 1, "frames");
+      setPaused(true);
+      return advance(n);
+    },
+
+    // Let this many frames pass, paused or not.
+    wait: function (a) { return advance(count(a.frames, 1, "frames")); },
+
+    // Hold keys down together for `frames`, let go, then let `after` more
+    // frames pass so that the next press is a separate one. The default is the
+    // minimum press a tap gets, for the same reason: the firmware scans the
+    // keyboard a little under once a frame.
+    press: function (a) {
+      var keys = keyList(a.keys);
+      var hold = count(a.frames, TAP_MIN_FRAMES, "frames");
+      var gap = count(a.after, TAP_MIN_FRAMES, "after");
+      return new Promise(function (resolve) {
+        ctlDown(keys);
+        afterFrames(hold, function () {
+          ctlUp(keys);
+          afterFrames(gap, function () { resolve({ frame: frameNo }); });
+        });
+      });
+    },
+
+    key_down: function (a) { ctlDown(keyList(a.keys)); return { frame: frameNo }; },
+    key_up: function (a) { ctlUp(keyList(a.keys)); return { frame: frameNo }; },
+    release_all: function () { ctlReleaseAll(); return { frame: frameNo }; },
+
+    // press, a character at a time. Checked whole before anything is pressed,
+    // so a string with one untypeable character types none of it.
+    type: function (a) {
+      var text = a.text === undefined || a.text === null ? "" : String(a.text);
+      var seq = [], bad = "";
+      for (var i = 0; i < text.length; i++) {
+        var names = typeKeys(text.charAt(i));
+        if (names) seq.push(keyList(names));
+        else if (bad.indexOf(text.charAt(i)) === -1) bad += text.charAt(i);
+      }
+      if (bad) throw new Error("no key types " + JSON.stringify(bad));
+      var hold = count(a.frames, TAP_MIN_FRAMES, "frames");
+      var gap = count(a.after, TAP_MIN_FRAMES, "after");
+      return new Promise(function (resolve) {
+        (function next(j) {
+          if (j === seq.length) { resolve({ frame: frameNo }); return; }
+          ctlDown(seq[j]);
+          afterFrames(hold, function () {
+            ctlUp(seq[j]);
+            afterFrames(gap, function () { next(j + 1); });
+          });
+        })(0);
+      });
+    },
+
+    screen: function (a) { return readScreen(!!a.cells); },
+    screenshot: function (a) {
+      return screenshot(a.format === undefined || a.format === null ? "png" : String(a.format));
+    },
+
+    read: function (a) {
+      var sp = memSpace(a);
+      var addr = count(a.addr, sp.lo, "addr");
+      var len = count(a.len, Math.max(0, sp.hi - addr), "len");
+      checkSpan(sp, addr, len);
+      var out = new Uint8Array(len);
+      for (var i = 0; i < len; i++)
+        out[i] = sp.at === null ? api.sfrPeek(addr + i) : heap[sp.at + addr + i];
+      return { hex: toHex(out) };
+    },
+
+    write: function (a) {
+      var sp = memSpace(a);
+      if (sp.at === null) throw new Error("sfr is read-only");
+      var addr = count(a.addr, 0, "addr"), bytes = fromHex(a.hex);
+      checkSpan(sp, addr, bytes.length);
+      heap.set(bytes, sp.at + addr);
+      return { len: bytes.length };
+    },
+
+    cpu: function () {
+      var psw = api.sfrPeek(0xd0), bank = (psw >> 3) & 3;
+      var iram = api.memory(SPACES.iram), r = [];
+      for (var i = 0; i < 8; i++) r.push(heap[iram + bank * 8 + i]);
+      return {
+        pc: api.pc(), a: api.sfrPeek(0xe0), b: api.sfrPeek(0xf0), psw: psw,
+        sp: api.sfrPeek(0x81), dptr: (api.sfrPeek(0x83) << 8) | api.sfrPeek(0x82),
+        bank: bank, r: r
+      };
+    },
+
+    // The reset line. The core's reset starts the EEPROM from blank, which is
+    // right for a ROM being swapped in but not here: the 24C02 is
+    // non-volatile, so it is put back.
+    reset: function () {
+      var at = api.nvram(), keep = heap.slice(at, at + api.nvramSize());
+      api.reset();
+      heap.set(keep, at);
+      ctlHeld = {};
+      releaseEverything();
+      return { frame: frameNo };
+    },
+
+    // Swap in a ROM image and reset into it, with a blank EEPROM or the one
+    // given. It takes the menu's extra slot, the one a dropped file uses.
+    load_rom: function (a) {
+      var bytes = fromBase64(a.base64, "base64");
+      if (!bytes.length || bytes.length > api.romBufferSize())
+        throw new Error("a ROM is 1 to " + api.romBufferSize() + " bytes, not " + bytes.length);
+      var eeprom = null;
+      if (a.eeprom !== undefined && a.eeprom !== null) {
+        eeprom = fromBase64(a.eeprom, "eeprom");
+        if (eeprom.length !== api.nvramSize())
+          throw new Error("the EEPROM is " + api.nvramSize() + " bytes, not " + eeprom.length);
+      }
+      var name = a.name === undefined || a.name === null ? "remote.bin" : String(a.name);
+      // The machine is about to be reset under them, so the remote end's keys
+      // are let go rather than pressed again on the new one.
+      ctlHeld = {};
+      return useExtraRom(name, bytes, true).then(function () {
+        if (eeprom) heap.set(eeprom, api.nvram());
+        return { frame: frameNo, name: name, size: bytes.length };
+      }, function () {
+        throw new Error("the ROM did not load");
+      });
+    }
+  };
+
+  // Commands that wait on frames, which never come without a ROM running.
+  var NEEDS_ROM = { step: true, wait: true, press: true, type: true };
+
+  function runCommand(msg) {
+    if (!msg || typeof msg !== "object" || Array.isArray(msg))
+      throw new Error("expected a JSON object");
+    var cmd = String(msg.cmd);
+    if (!own(COMMANDS, cmd)) throw new Error('unknown command "' + cmd + '"');
+    if (own(NEEDS_ROM, cmd) && !running) throw new Error("no ROM is loaded yet");
+    return COMMANDS[cmd](msg);
+  }
+
+  function showBadge() {
+    remoteBadge.classList.toggle("on", !!(control && control.connected()));
+    remoteBadge.textContent = paused ? "Remote control · paused" : "Remote control";
+  }
+
+  function createControl(url) {
+    var ws = null, attempt = 0, up = false;
+
+    function log(txt) {
+      if (window.console) window.console.log("Minitel control: " + txt);
+    }
+
+    function send(msg) {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
+    }
+
+    function handle(text) {
+      var msg = null;
+      try { msg = JSON.parse(text); } catch (e) { /* runCommand says so */ }
+      var id = (msg && typeof msg === "object") ? msg.id : undefined;
+      new Promise(function (resolve) { resolve(runCommand(msg)); }).then(function (res) {
+        send(mergeInto({ id: id, ok: true }, res));
+      }, function (err) {
+        send({ id: id, ok: false, error: String(err && err.message ? err.message : err) });
+      });
+    }
+
+    function connect() {
+      try { ws = new WebSocket(url); } catch (e) {
+        warn("control: " + url + " is not a usable websocket URL");
+        return;
+      }
+
+      ws.onopen = function () {
+        attempt = 0;
+        up = true;
+        log("connected to " + url);
+        showBadge();
+        send(mergeInto({ event: "hello" }, COMMANDS.info()));
+      };
+
+      ws.onmessage = function (e) { if (typeof e.data === "string") handle(e.data); };
+
+      ws.onclose = function () {
+        ws = null;
+        if (up) {
+          up = false;
+          log("disconnected");
+          // The cable has been pulled: hand the machine back to the visitor
+          // rather than leave it frozen, or holding keys nobody will release.
+          ctlReleaseAll();
+          if (paused) setPaused(false);
+          showBadge();
+        }
+        // The bridge is a local process that comes and goes as scripts are
+        // run, so keep looking for it -- briskly, but not in a tight loop.
+        setTimeout(connect, Math.min(500 * (1 << Math.min(attempt++, 3)), 4000));
+      };
+
+      ws.onerror = function () { /* onclose does the recovering */ };
+    }
+
+    connect();
+    return { connected: function () { return up; } };
+  }
+
   // ---------------------------------------------------------------------
   // Boot
   // ---------------------------------------------------------------------
@@ -2443,6 +3124,11 @@
         return romIndex === 0 ? Promise.reject() : selectRom(0);
       })
       .catch(askForRom);
+
+    if (CONTROL_URL) {
+      hiddenClock = createHiddenClock(MACHINE_HZ);
+      control = createControl(CONTROL_URL);
+    }
   });
 })();
 </script>

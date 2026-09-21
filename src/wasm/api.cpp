@@ -282,3 +282,58 @@ EXPORT int mt_nvram_size()
 {
 	return int(minitel_machine::NVRAM_SIZE);
 }
+
+// REMOTE CONTROL
+//
+// What a program driving the page from outside needs besides the keyboard:
+// the screen as text, and the machine's memories to read and patch.
+
+// ts9347_device::TEXT_ROWS rows of TEXT_STRIDE cells, four bytes each -- see
+// ts9347_device::text_cells() for the layout -- of which mt_text_columns() are
+// in use.
+EXPORT const u8 *mt_text_cells()
+{
+	return g_machine->text_cells();
+}
+
+EXPORT int mt_text_columns()
+{
+	return g_machine->text_columns();
+}
+
+// The memories by number: 0 the 80C32's internal RAM, 1 the video RAM, 2 the
+// EEPROM, 3 the ROM image as it was loaded. Anything else is null and empty.
+EXPORT u8 *mt_memory(int space)
+{
+	switch (space)
+	{
+	case 0: return g_machine->internal_ram();
+	case 1: return g_machine->vram();
+	case 2: return g_machine->nvram();
+	case 3: return g_machine->cart();
+	default: return nullptr;
+	}
+}
+
+EXPORT int mt_memory_size(int space)
+{
+	switch (space)
+	{
+	case 0: return int(minitel_machine::INTERNAL_RAM_SIZE);
+	case 1: return int(minitel_machine::vram_size());
+	case 2: return int(minitel_machine::NVRAM_SIZE);
+	case 3: return int(g_machine->cart_size());
+	default: return 0;
+	}
+}
+
+// An SFR read without the side effects of reading it; 0 outside 0x80-0xff.
+EXPORT int mt_sfr_peek(int r)
+{
+	return (r >= 0x80 && r <= 0xff) ? g_machine->sfr_peek(u8(r)) : 0;
+}
+
+EXPORT int mt_pc()
+{
+	return g_machine->pc();
+}
