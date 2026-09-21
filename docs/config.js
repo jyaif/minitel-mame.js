@@ -25,7 +25,7 @@ window.MINITEL_CONFIG = {
   //
   roms: [
     { name: "Dino",         file: "dino.bin" },
-    { name: "Raycast",         file: "raycast.bin" },
+    { name: "Raycast",         file: "raycaster.bin" },
     { name: "Volleyball",         file: "volleyball.bin" },
     { name: "Hello Modem",  file: "hello_modem.bin" },
     { name: "Demo Minitel", file: "demo_minitel.bin" },
