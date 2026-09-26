@@ -27,6 +27,11 @@ window.MINITEL_CONFIG = {
     { name: "Dino",         file: "dino.bin" },
     { name: "Raycast",         file: "raycaster.bin" },
     { name: "Volleyball",         file: "volleyball.bin" },
+
+    { name: "Chess",         file: "chess.bin" },
+    { name: "Mode 7",         file: "mode7.bin" },
+    { name: "Falldown",         file: "falldown.bin" },
+    { name: "OutRun",         file: "outrun.bin" },
     { name: "Hello Modem",  file: "hello_modem.bin" },
     { name: "Demo Minitel", file: "demo_minitel.bin" },
 
